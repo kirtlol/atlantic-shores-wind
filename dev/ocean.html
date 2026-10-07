@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ocean dev</title>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"}}
+</script>
+<style>html, body { margin: 0; height: 100%; overflow: hidden; background: #000; } canvas { display: block; width: 100%; height: 100%; }</style>
+</head>
+<body>
+<script type="module">
+// Ocean dev page. URL parameters:
+//   view=drone|deck|sunset|blitz|night    time=16.5 (local hours)   wind=4.5   clouds=0.28
+//   quality=low|high|ultra   t=100 (animation seconds at start)   warm=90 (frames simulated first)
+//   fixed=1 (fixed 1/60 s steps: reproducible)   freeze=1   atmos=real|stub   date=06-21   metrics=1
+//   check=1 (CPU vs GPU heights)   perf=1 (cost breakdown)   calib=1 (whitecap coverage vs wind)
+//   calibsearch=1 | =<offset> (bias table by bisection; the cascade-0 Jacobian bias = cascade 1's + offset)
+//   depth=reversed (reversed-Z depth buffer instead of logarithmic)
+import * as THREE from 'three';
+import { U, param, SCALE_REGISTRY, azimuthToDir, curvatureDrop } from '../src/shared.js';
+import { CAMERA_PRESETS, QUALITY, RENDER, SEA } from '../src/config.js';
+import { Ocean } from '../src/ocean/ocean.js';
+import { Post } from '../src/post/post.js';
+import { StubAtmosphere } from './stubs/ocean-atmosphere.js';
+import { makeApplyAtmosphere } from './stubs/ocean-fog.js';
+import { buildStandins } from './stubs/ocean-standins.js';
+import { consistencyCheck, lagrangianCheck } from './stubs/ocean-probe.js';
+import { termProbe, blackSea } from './stubs/ocean-terms.js';
+
+const DEG = Math.PI / 180;
+const VIEWS = {
+  drone:  { ...CAMERA_PRESETS.drone, time: 16.5 },
+  deck:   { position: [-13.8, 4.0, 11.6], headingDeg: 50, pitchDeg: -7, vfovDeg: 60, time: 16.5 },
+  sunset: { position: [420, 32, -60], headingDeg: 297, pitchDeg: -3.5, vfovDeg: 45, time: 19.75 },
+  blitz:  { position: [-100, 30, 60], headingDeg: 60, pitchDeg: -33, vfovDeg: 45, time: 16.5, blitzAt: [-63, 39] },
+  overview: { ...CAMERA_PRESETS.overview, time: 16.5 },
+  night:  { position: [-649.5, 127.5, 420.9], headingDeg: 135, pitchDeg: -3.2, vfovDeg: 45, time: 23.0, date: '06-29', moon: { az: 150, el: 16, phase: 0.5 } },
+};
+const viewName = param('view', 'drone');
+const V = VIEWS[viewName] || VIEWS.drone;
+const quality = QUALITY[param('quality', 'high')] || QUALITY.high;
+const fixed = param('fixed', true);
+const frozen = param('freeze', false);
+const warm = param('warm', 90);
+U.uTime.value = param('t', 100);
+U.uCloudCover.value = param('clouds', 0.28);
+
+// ---------------------------------------------------------------- renderer, camera
+// depth=reversed: reversed-Z (EXT_clip_control) instead of the logarithmic depth buffer, to A/B the mirror's oblique clip
+const reversedZ = param('depth', 'log') === 'reversed';
+const renderer = new THREE.WebGLRenderer({ antialias: false, logarithmicDepthBuffer: !reversedZ && RENDER.logarithmicDepthBuffer, reversedDepthBuffer: reversedZ, powerPreference: 'high-performance' });
+renderer.setPixelRatio(1);
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(V.vfovDeg, innerWidth / innerHeight, RENDER.near, RENDER.far);
+camera.rotation.order = 'YXZ';
+camera.position.fromArray(V.position);
+camera.rotation.set(V.pitchDeg * DEG, -V.headingDeg * DEG, 0);
+camera.updateMatrixWorld();
+
+// ---------------------------------------------------------------- modules
+const ctx = { renderer, scene, camera, quality };
+let atmosphere, applyAtmosphere;
+const [dateM, dateD] = String(param('date', V.date || '06-21')).split('-').map(Number);
+if (param('atmos', 'real') === 'real') {
+  // fog.js patches THREE.ShaderChunk at import: it must load before anything compiles.
+  const fog = await import('../src/env/fog.js');
+  const [{ Atmosphere }, { SimClock }] = await Promise.all([import('../src/env/atmosphere.js'), import('../src/env/time.js')]);
+  ctx.clock = new SimClock({ month: dateM, day: dateD, hours: param('time', V.time), speed: 1 });
+  atmosphere = new Atmosphere(ctx);
+  applyAtmosphere = fog.applyAtmosphere;
+} else {
+  atmosphere = new StubAtmosphere(ctx, { hours: param('time', V.time), moon: V.moon });
+  applyAtmosphere = makeApplyAtmosphere(atmosphere);
+}
+ctx.atmosphere = atmosphere;
+const standins = buildStandins(scene, applyAtmosphere, { night: param('time', V.time) > 21 || param('time', V.time) < 5 });
+const ocean = new Ocean(ctx);
+ctx.ocean = ocean;
+ocean.setPiles(standins.piles);
+if (param('black', false)) blackSea(ocean);
+if (param('polarizer', -1) >= 0) U.uPolarizer.value = Math.min(Math.max(param('polarizer', 1), 0), 1);
+ocean.setSeaState({ windSpeed: param('wind', SEA.windSpeed) }, { immediate: true });
+const post = new Post(ctx);
+
+// ---------------------------------------------------------------- forced disturbances (blitz view)
+const events = [];
+if (V.blitzAt || param('blitz', false)) {
+  const [bx, bz] = V.blitzAt || [0, 60];
+  const seq = [
+    [0.0, { kind: 'boil', dx: -6, dz: 3, radius: 3.2, strength: 1, duration: 7, foam: 0.9 }],
+    [1.2, { kind: 'splash', dx: 4, dz: -2, radius: 1.1, strength: 1, duration: 4, foam: 1.2 }],
+    [2.1, { kind: 'splash', dx: 7, dz: 5, radius: 0.7, strength: 0.8, duration: 3, foam: 1.0 }],
+    [3.0, { kind: 'splash', dx: -1, dz: 8, radius: 1.4, strength: 1.2, duration: 5, foam: 1.3 }],
+    [3.6, { kind: 'boil', dx: 10, dz: -6, radius: 2.2, strength: 0.8, duration: 5, foam: 0.8 }],
+    [4.2, { kind: 'splash', dx: -8, dz: -5, radius: 0.5, strength: 0.7, duration: 2.5, foam: 1.0 }],
+    [4.6, { kind: 'splash', dx: 2, dz: 2, radius: 0.9, strength: 1, duration: 3.5, foam: 1.2 }],
+  ];
+  const rs = param('ringstrength', 1);
+  if (param('rings', false)) seq.splice(0, seq.length,
+    [0.0, { kind: 'splash', dx: -6, dz: 0, radius: 1.0, strength: rs, duration: 4, foam: 0 }],
+    [1.5, { kind: 'splash', dx: 5, dz: 2, radius: 0.6, strength: rs, duration: 4, foam: 0 }],
+    [3.0, { kind: 'splash', dx: 0, dz: 9, radius: 0.8, strength: rs, duration: 4, foam: 0 }]);
+  const t0 = U.uTime.value + (warm > 0 ? -5.0 : 0.5);
+  for (const [dt, e] of seq) events.push({ t: t0 + dt, e: { ...e, x: bx + e.dx, z: bz + e.dz } });
+  // a wake trail passing the scene (vessel stand-in), laid down over the last 40 s
+  const trail = [];
+  if (!param('rings', false))
+  for (let i = 0; i <= 120; i++) trail.push({ t: U.uTime.value - 40 + i / 3, x: bx - 140 + i * 2.2, z: bz + 45 - i * 0.35 });
+  events.push(...trail.map((p) => ({ t: p.t, trail: p })));
+  events.sort((a, b) => a.t - b.t);
+}
+function fireEvents(t) {
+  while (events.length && events[0].t <= t) {
+    const ev = events.shift();
+    if (ev.e) ocean.addDisturbance(ev.e);
+    else { ocean.addFoamTrail([{ x: ev.trail.x, z: ev.trail.z, t: ev.t }], { key: 'ctv', width: 7, lifetime: 70, spread: 0.18, foam: 1.0 }); lastTrail = ev; }
+  }
+  // its Kelvin wave source at the bow (≈ 28 m ahead of the transom trail), sent every frame
+  const tp = lastTrail?.trail, fresh = tp && t - lastTrail.t < 0.5;
+  ocean.setWaveSources(fresh ? [{ x: tp.x + 0.988 * 28, z: tp.z - 0.157 * 28, dirX: 0.988, dirZ: -0.157, speed: 6.6 }] : []);
+}
+let lastTrail = null;
+
+// ---------------------------------------------------------------- loop
+let holding = false;             // after the report, time stops so the screenshot shows that frame
+function step(dt) {
+  if (holding) dt = 0;
+  if (!frozen) U.uTime.value += dt;
+  const t = U.uTime.value;
+  fireEvents(t);
+  atmosphere.update(dt, t, camera);
+  ocean.update(dt, t, camera);
+}
+// warm-up: simulate `warm` frames (foam history, disturbances in flight) before the first shot
+if (warm > 0) { const start = U.uTime.value; U.uTime.value = start - warm / 60; for (let i = 0; i < warm; i++) step(1 / 60); }
+await renderer.compileAsync(scene, camera, scene);
+let last = performance.now(), frames = 0;
+function frame() {
+  const now = performance.now();
+  const dt = fixed ? 1 / 60 : Math.min(0.1, (now - last) / 1000);
+  last = now;
+  step(dt);
+  post.render(dt);
+  frames++;
+  if (frames === 3) onReady();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------------------------------------------------------------- measurements
+function srgbToLin(c) { c /= 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+function linY(r, g, b) { return 0.2126 * srgbToLin(r) + 0.7152 * srgbToLin(g) + 0.0722 * srgbToLin(b); }
+function hex(r, g, b) { return '#' + [r, g, b].map((v) => Math.round(v).toString(16).padStart(2, '0')).join(''); }
+function readCanvas() {
+  const gl = renderer.getContext();
+  const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+  const px = new Uint8Array(w * h * 4);
+  gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  return { w, h, at: (x, y) => { const i = ((h - 1 - y) * w + x) * 4; return [px[i], px[i + 1], px[i + 2]]; } };
+}
+function photoMetrics() {
+  step(1 / 60); post.render(1 / 60);
+  const img = readCanvas();
+  const tanH = Math.tan(camera.fov * DEG / 2);
+  const depOf = (y) => -(camera.rotation.x / DEG + Math.atan((1 - 2 * (y + 0.5) / img.h) * tanH) / DEG);
+  const rows = [];
+  const bands = [[0.35, 0.65], [0.9, 1.1], [1.9, 2.2], [2.9, 3.1], [4.4, 4.8], [6.6, 7.0], [7.1, 7.6], [9.2, 9.5], [12.3, 12.7], [15.3, 15.8], [17.5, 18.6]];
+  for (const [d0, d1] of bands) {
+    const ys = []; for (let y = 0; y < img.h; y++) { const d = depOf(y); if (d >= d0 && d <= d1) ys.push(y); }
+    if (!ys.length) continue;
+    const Ys = [], cols = [0, 0, 0];
+    for (const y of ys) for (let x = 0; x < img.w; x += 2) { const c = img.at(x, y); Ys.push(linY(...c)); cols[0] += c[0]; cols[1] += c[1]; cols[2] += c[2]; }
+    Ys.sort((a, b) => a - b);
+    const n = Ys.length, mean = Ys.reduce((s, v) => s + v, 0) / n;
+    const dep = (d0 + d1) / 2, target = 0.586 * Math.exp(-0.134 * dep);
+    // sky at the mirror elevation (median of the rows d0..d1 above the horizon) -> effective reflectance
+    const sk = []; for (let y = 0; y < img.h; y++) { const d = depOf(y); if (-d >= d0 && -d <= d1) for (let x = 0; x < img.w; x += 4) sk.push(linY(...img.at(x, y))); }
+    sk.sort((a, b) => a - b);
+    const skyY = sk.length ? sk[Math.floor(sk.length / 2)] : NaN;
+    rows.push({ dep: +dep.toFixed(2), rows: `${ys[0]}-${ys[ys.length - 1]}`, meanHex: hex(cols[0] / n, cols[1] / n, cols[2] / n), meanY: +mean.toFixed(4), targetY: +target.toFixed(4), ratio: +(mean / target).toFixed(2), p10: +Ys[Math.floor(n * 0.1)].toFixed(4), p90: +Ys[Math.floor(n * 0.9)].toFixed(4), contrast: +(Ys[Math.floor(n * 0.9)] / Math.max(Ys[Math.floor(n * 0.1)], 1e-4)).toFixed(1), seaOverSky: +(mean / skyY).toFixed(2) });
+  }
+  // bottom-left vs bottom-right (last 36 rows)
+  let L = 0, R = 0, nL = 0, nR = 0;
+  for (let y = img.h - 36; y < img.h; y++) for (let x = 0; x < img.w; x++) { const Y = linY(...img.at(x, y)); if (x < img.w / 3) { L += Y; nL++; } else if (x > 2 * img.w / 3) { R += Y; nR++; } }
+  // horizon row: first row below the sky/sea edge at the centre column
+  return { view: viewName, size: [img.w, img.h], exposure: +post.exposure.toFixed(3), bands: rows, bottomLeftOverRight: +((L / nL) / (R / nR)).toFixed(2) };
+}
+function perf() {
+  const gl = renderer.getContext();
+  const px = new Uint8Array(4);
+  const run = (n) => { for (let i = 0; i < 5; i++) { step(1 / 60); post.render(1 / 60); } gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); const t0 = performance.now(); for (let i = 0; i < n; i++) { step(1 / 60); post.render(1 / 60); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); } return (performance.now() - t0) / n; };
+  const full = run(60);
+  ocean.reflection.enabled = false; const noRefl = run(60); ocean.reflection.enabled = true;
+  const upd = ocean.update.bind(ocean);
+  ocean.update = () => {}; ocean.mesh.visible = false; const none = run(60); ocean.mesh.visible = true; ocean.update = upd;
+  const fftOnly = (() => { ocean.mesh.visible = false; const r = run(60); ocean.mesh.visible = true; return r; })();
+  const info = renderer.info.render;
+  return { msFull: +full.toFixed(2), msNoReflection: +noRefl.toFixed(2), msNoOcean: +none.toFixed(2), msUpdateOnlyNoDraw: +fftOnly.toFixed(2), oceanShare: +(full - none).toFixed(2), reflectionShare: +(full - noRefl).toFixed(2), drawCalls: info.calls, triangles: info.triangles };
+}
+// GPU time of drawing only the ocean mesh into a 1600x900 HalfFloat MSAA target (the composer's
+// format), min over batches (robust to other GPU users). EXT_disjoint_timer_query_webgl2 when
+// available, else wall-clock with a readPixels sync.
+function oceanDrawMs(batches = 6, n = 10) {
+  const gl = renderer.getContext();
+  const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  const rt = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: quality.msaa });
+  const only = new THREE.Scene();
+  const parent = ocean.mesh.parent;
+  only.add(ocean.mesh);
+  const px = new Uint16Array(4);
+  renderer.setRenderTarget(rt); renderer.render(only, camera); renderer.readRenderTargetPixels(rt, 0, 0, 1, 1, px);
+  let best = Infinity;
+  for (let b = 0; b < batches; b++) {
+    const t0 = performance.now();
+    for (let i = 0; i < n; i++) renderer.render(only, camera);
+    renderer.readRenderTargetPixels(rt, 0, 0, 1, 1, px);
+    best = Math.min(best, (performance.now() - t0) / n);
+  }
+  renderer.setRenderTarget(null);
+  parent.add(ocean.mesh);
+  rt.dispose();
+  return { ms: +best.toFixed(2), timerQuery: !!ext };
+}
+function oceanUpdateMs(batches = 6, n = 10) {
+  const px = new Uint16Array(4);
+  const sync = () => { renderer.readRenderTargetPixels(ocean.fft.disp[0], 0, 0, 1, 1, px); if (ocean.reflection.enabled) renderer.readRenderTargetPixels(ocean.reflection.target, 0, 0, 1, 1, px); };
+  let best = Infinity;
+  for (let b = 0; b < batches; b++) {
+    sync();
+    const t0 = performance.now();
+    for (let i = 0; i < n; i++) { U.uTime.value += 1 / 60; ocean.update(1 / 60, U.uTime.value, camera); }
+    sync();
+    best = Math.min(best, (performance.now() - t0) / n);
+  }
+  return +best.toFixed(2);
+}
+// Cost of each fragment term: variants of the ocean material (dev-only shader patches), timed
+// interleaved (A B C A B C ...) so other GPU users slow all of them alike; min per variant.
+function perfBreakdown() {
+  const base = ocean._material;
+  const variants = {
+    bare0: [['vec3 Lk = textureGrad(uSkyMap, ocSkyMapUv(Rk), vec2(dSky.x, 0.0), vec2(0.0, dSky.y)).rgb;', 'vec3 Lk = vec3(0.05, 0.1, 0.2);'], ['C = applyAerialPerspective(C, P);', 'C = C * OC_PRE;'], ['float shadowSun = shadow * ocTowerShadow(pq, uSunDir);', 'float shadowSun = 1.0;'], ['if (uMirrorOn > 0.5) {', 'if (false) {']],
+    noFoam0: [['if (FD > 0.004) {', 'if (false) {']],
+    full: [],
+    noSky: [['vec3 Lk = textureGrad(uSkyMap, ocSkyMapUv(Rk), vec2(dSky.x, 0.0), vec2(0.0, dSky.y)).rgb;', 'vec3 Lk = vec3(0.05, 0.1, 0.2);']],
+    noAerial: [['C = applyAerialPerspective(C, P);', 'C = C * OC_PRE;']],
+    noCloudShadow: [['float shadowSun = shadow * ocTowerShadow(pq, uSunDir);', 'float shadowSun = 1.0;']],
+    noMirror: [['if (uMirrorOn > 0.5) {', 'if (false) {']],
+    noFoam: [['if (FD > 0.004) {', 'if (false) {']],
+    bare: [['vec3 Lk = textureGrad(uSkyMap, ocSkyMapUv(Rk), vec2(dSky.x, 0.0), vec2(0.0, dSky.y)).rgb;', 'vec3 Lk = vec3(0.05, 0.1, 0.2);'], ['C = applyAerialPerspective(C, P);', 'C = C * OC_PRE;'], ['float shadowSun = shadow * ocTowerShadow(pq, uSunDir);', 'float shadowSun = 1.0;'], ['if (uMirrorOn > 0.5) {', 'if (false) {']],
+    full2: [['// camera polarizer', '// camera polarizer (variant)']],
+  };
+  const mats = {};
+  for (const [name, reps] of Object.entries(variants)) {
+    const m = base.clone();
+    m.uniforms = base.uniforms;                       // share live uniforms
+    m.onBeforeCompile = (sh) => { for (const [a, b] of reps) sh.fragmentShader = sh.fragmentShader.replace(a, b); };
+    m.customProgramCacheKey = () => 'perf-' + name;
+    mats[name] = m;
+  }
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  const rt = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: quality.msaa });
+  const only = new THREE.Scene(), parent = ocean.mesh.parent;
+  only.add(ocean.mesh);
+  const px = new Uint16Array(4);
+  const best = {};
+  renderer.setRenderTarget(rt);
+  for (const [name, m] of Object.entries(mats)) { ocean.mesh.material = m; renderer.render(only, camera); renderer.readRenderTargetPixels(rt, 0, 0, 1, 1, px); best[name] = Infinity; }
+  for (let round = 0; round < 10; round++) {
+    for (const [name, m] of Object.entries(mats)) {
+      ocean.mesh.material = m;
+      renderer.readRenderTargetPixels(rt, 0, 0, 1, 1, px);
+      const t0 = performance.now();
+      for (let i = 0; i < 6; i++) renderer.render(only, camera);
+      renderer.readRenderTargetPixels(rt, 0, 0, 1, 1, px);
+      best[name] = Math.min(best[name], (performance.now() - t0) / 6);
+    }
+  }
+  renderer.setRenderTarget(null);
+  ocean.mesh.material = base;
+  parent.add(ocean.mesh);
+  rt.dispose();
+  for (const k in best) best[k] = +best[k].toFixed(2);
+  best.update = oceanUpdateMs();
+  const pxs = new Uint16Array(4), timeIt = (fn) => { let b = Infinity; for (let k = 0; k < 6; k++) { renderer.readRenderTargetPixels(ocean.fft.disp[0], 0, 0, 1, 1, pxs); const t0 = performance.now(); for (let i = 0; i < 10; i++) fn(); renderer.readRenderTargetPixels(ocean.fft.disp[0], 0, 0, 1, 1, pxs); renderer.readRenderTargetPixels(ocean.skyMap.target, 0, 0, 1, 1, pxs); b = Math.min(b, (performance.now() - t0) / 10); } return +b.toFixed(2); };
+  best.fftOnly = timeIt(() => { U.uTime.value += 1 / 60; ocean.fft.update(U.uTime.value, 1 / 60); });
+  best.skyMapOnly = timeIt(() => { ocean.skyMap._frame = 0; ocean.skyMap.update(camera, U.uTime.value); });
+  ocean.reflection.enabled = false; best.updateNoReflection = oceanUpdateMs(); ocean.reflection.enabled = true;
+  return best;
+}
+// Foam state (stage A, streak, J, stage B) of cascade c as half floats (the foam array's layer c).
+function readFoam(c, buf = new Uint16Array(256 * 256 * 4)) {
+  const rt = ocean.fft.sf[ocean.fft.flip];
+  renderer.setRenderTarget(rt, c);
+  renderer.readRenderTargetPixels(rt, 0, 0, 256, 256, buf, undefined, 1);
+  renderer.setRenderTarget(null);
+  return buf;
+}
+async function whitecapCalibration() {
+  // fraction of foam-covered texels (whitecap > 0.5) in cascades 0/1 after 20 s of sea at each wind
+  const out = [];
+  for (const U10 of [4.5, 5.5, 6, 7, 8, 10, 12]) {
+    ocean.setSeaState({ windSpeed: U10 }, { immediate: true });
+    for (let i = 0; i < 1200; i++) { U.uTime.value += 1 / 60; ocean.fft.update(U.uTime.value, 1 / 60); }
+    const fr = [], jq = [];
+    for (let c = 0; c < 2; c++) {
+      const buf = readFoam(c);
+      let n = 0; const J = new Float32Array(65536);
+      for (let i = 0; i < 256 * 256; i++) { if (THREE.DataUtils.fromHalfFloat(buf[i * 4]) > 0.5) n++; J[i] = THREE.DataUtils.fromHalfFloat(buf[i * 4 + 2]); }
+      J.sort();
+      fr.push(n / 65536);
+      jq.push([0.0001, 0.001, 0.005, 0.02, 0.1, 0.5].map((q) => +J[Math.floor(q * 65535)].toFixed(3)));
+    }
+    const monahan = 3.84e-4 * Math.pow(U10, 3.41) / 100;
+    out.push({ U10, c0: +(fr[0] * 100).toFixed(3), c1: +(fr[1] * 100).toFixed(3), combinedPct: +((0.8 * fr[0] + fr[1]) * 100).toFixed(3), monahanPct: +(monahan * 100).toFixed(3), jQuantiles_0_01_1_5_20_100_500permille: jq });
+  }
+  ocean.setSeaState({ windSpeed: param('wind', SEA.windSpeed) }, { immediate: true });
+  return out;
+}
+// Bisection per wind speed for the cascade-1 Jacobian bias (cascade 0 = bias + offset) whose
+// equilibrium mean foam density (what the shader turns into coverage) matches Monahan W(U).
+function whitecapSearch(offset = 0.12) {   // ocean.js WHITECAP_OFFSET
+  const out = [];
+  const coverage = () => {
+    let tot = 0;
+    for (let c = 0; c < 2; c++) {
+      const buf = readFoam(c);
+      // visibly white cover (what photographs count as whitecap): texels whose foam, stage A +
+      // 0.6 x stage B, is dense enough (≥ 0.5) to render as white rather than grey lace
+      let n = 0; for (let i = 0; i < 65536; i++) n += (THREE.DataUtils.fromHalfFloat(buf[i * 4]) + 0.6 * THREE.DataUtils.fromHalfFloat(buf[i * 4 + 3])) >= 0.5 ? 1 : 0;
+      tot += (c === 0 ? 0.8 : 1) * n / 65536;
+    }
+    return tot;
+  };
+  for (const U10 of [5.5, 6.5, 8, 10, 12, 15, 20]) {
+    ocean.setSeaState({ windSpeed: U10 }, { immediate: true });
+    ocean.update(0, U.uTime.value, camera);             // apply the state (choppiness) to the FFT
+    const target = 3.84e-4 * Math.pow(U10, 3.41) / 100;
+    let lo = 0.6, hi = 0.98, cov = 0;
+    for (let it = 0; it < 8; it++) {
+      const b = 0.5 * (lo + hi);
+      ocean.fft.whitecap = { bias: [b + offset, b], gain: ocean.fft.whitecap.gain > 0 && ocean.fft.whitecap.bias[1] > 0 ? ocean.fft.whitecap.gain : 40 };
+      const cc = renderer.getClearColor(new THREE.Color()), ca = renderer.getClearAlpha();
+      renderer.setClearColor(0x000000, 0);                 // alpha is the stage-B foam: start from none
+      for (const rt of ocean.fft.sf) for (let c = 0; c < ocean.fft.count; c++) { renderer.setRenderTarget(rt, c); renderer.clear(); }
+      renderer.setClearColor(cc, ca);
+      renderer.setRenderTarget(null);
+      for (let i = 0; i < 1500; i++) { U.uTime.value += 1 / 60; ocean.fft.update(U.uTime.value, 1 / 60); }   // 25 s: stage B (6 s) settles
+      cov = coverage();
+      if (cov > target) hi = b; else lo = b;
+    }
+    out.push({ U10, bias: +(0.5 * (lo + hi)).toFixed(4), coveragePct: +(cov * 100).toFixed(3), monahanPct: +(target * 100).toFixed(3) });
+  }
+  ocean.setSeaState({ windSpeed: param('wind', SEA.windSpeed) }, { immediate: true });
+  return out;
+}
+async function onReady() {
+  const report = {};
+  if (param('check', false)) {
+    const c = camera.position;
+    report.consistency = consistencyCheck(ocean, U.uTime.value, 512, 600, c.x, c.z);
+    report.consistencyFar = consistencyCheck(ocean, U.uTime.value, 256, 5000, 3000, -2000);
+    report.lagrangian = lagrangianCheck(ocean, U.uTime.value, 256, 400, c.x, c.z);
+    report.cpuTiming = (() => { const t = U.uTime.value; const t0 = performance.now(); let s = 0; for (let i = 0; i < 2000; i++) s += ocean.getHeight(i * 1.7, i * 0.9, t); return { usPerGetHeight: +((performance.now() - t0) / 2000 * 1000).toFixed(1) }; })();
+  }
+  if (param('metrics', false)) report.metrics = photoMetrics();
+  if (param('terms', false)) report.terms = termProbe(ocean, renderer, scene, camera, [[0.5, 0.97], [0.2, 0.97], [0.8, 0.97], [0.5, 0.75], [0.5, 0.55], [0.5, 0.43]]);
+  if (param('perf', false)) report.perf = perf();
+  if (param('perfterms', false)) report.perfTerms = perfBreakdown();
+  if (param('calib', false)) report.whitecaps = await whitecapCalibration();
+  if (param('calibsearch', 0)) report.whitecapSearch = whitecapSearch(param('calibsearch', 0) === 1 ? undefined : param('calibsearch', 0));   // =1, or =<cascade-0 offset>
+  if (param('mirrorstats', false)) {
+    const rt = ocean.reflection.target, W = rt.width, H = rt.height;
+    const buf = new Uint16Array(W * H * 4);
+    renderer.readRenderTargetPixels(rt, 0, 0, W, H, buf);
+    let maxR = 0, at = null, nz = 0, maxA = 0;
+    for (let i = 0; i < W * H; i++) { const r = THREE.DataUtils.fromHalfFloat(buf[i * 4]), a = THREE.DataUtils.fromHalfFloat(buf[i * 4 + 3]); if (r > maxR) { maxR = r; at = [i % W, Math.floor(i / W)]; } if (r > 0 || a > 0) nz++; maxA = Math.max(maxA, a); }
+    report.mirror = { size: [W, H], maxR, at, nonZeroTexels: nz, maxA, pre: atmosphere.preExposure, logFar: ocean.reflection.logFar };
+  }
+  if (param('qswitch', false)) {
+    const seq = [];
+    for (const q of ['low', 'ultra', 'high']) { ocean.setQuality(QUALITY[q]); for (let i = 0; i < 20; i++) { step(1 / 60); post.render(1 / 60); } seq.push({ q, cascades: ocean.fft.active, rings: ocean._rings, reflection: ocean.reflection.enabled, h: +ocean.getHeight(10, 20).toFixed(3) }); }
+    report.qualitySwitch = seq;
+  }
+  if (param('transition', false)) {
+    const t0 = U.uTime.value, log = [];
+    ocean.setSeaState({ windSpeed: 12, windFromDeg: 250 });
+    for (let i = 0; i <= 300; i++) { step(1 / 60); if (i % 60 === 0) log.push({ s: +(U.uTime.value - t0).toFixed(1), eased: +ocean.eased.windSpeed.toFixed(2), applied: +ocean.applied.windSpeed.toFixed(2), Hs: +ocean.R.windHs.toFixed(2), uWind: +U.uWindSpeed.value.toFixed(1) }); }
+    report.transition = log;
+  }
+  if (param('scales', false)) report.scales = SCALE_REGISTRY.filter((e) => e.name.startsWith('ocean')).map((e) => { const m = e.measure().x; return { name: e.name, measured: +m.toFixed(3), expect: e.expect.metres, tol: e.expect.tolerance, ok: Math.abs(m - e.expect.metres) <= e.expect.tolerance }; });
+  report.sea = { ...ocean.target, windHs: +ocean.R.windHs.toFixed(3), windTp: +ocean.R.windTp.toFixed(2) };
+  report.sun = { elevation: +atmosphere.sunElevationDeg.toFixed(2), moonAz: +(atmosphere.moonAzimuthDeg ?? atmosphere.moon?.az ?? 0).toFixed(1), moonEl: +(atmosphere.moonElevationDeg ?? atmosphere.moon?.el ?? 0).toFixed(1) };
+  report.render = { calls: renderer.info.render.calls, triangles: renderer.info.render.triangles, programs: renderer.info.programs.length };
+  console.log('OCEAN_REPORT ' + JSON.stringify(report));
+  window.__oceanReport = report;
+  holding = param('hold', true);
+  window.__sceneReady = true;
+}
+window.__ocean = ocean; window.__U = U;
+</script>
+</body>
+</html>

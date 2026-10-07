@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>dev: atmosphere + day/night</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; }
+  #hud { position: fixed; left: 8px; top: 6px; font: 12px/1.35 ui-monospace, Menlo, monospace; color: #fff; text-shadow: 0 0 3px #000; pointer-events: none; white-space: pre; }
+</style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<div id="hud"></div>
+<script type="module">
+// Standalone test page for src/env/{time,atmosphere,fog}.js (stubs: dev/stubs/atmosphere-*.js).
+// URL: time=16.5 (local hours) | date=06-21 | clouds=0.28 | view=drone|sun|moon|city|zenith|south|overview
+//      | az=&el=&fov= (custom view from the drone position) | cam=x,y,z | play=1&speed=600
+//      | freeze=1&t=0 | hud=0 | quality=low|high|ultra
+//      | exposure=rule|photofit (Post stand-in anchor) | nightgain=3e4 (night exposure cap x day)
+//      | probe=1 (aerial-perspective transmittance probes) | perf=1 (GPU/CPU cost) | sea=basic|none
+//      | pol=0.7 (camera polarizer strength, U.uPolarizer; the shell drives it by camera height)
+//      | calibrate=1 (re-derive the cloud cover table and print it beside the baked clouds.js COVER_TABLE)
+// Prints one "ATMOS_REPORT {json}" console line (sun/moon, exposure, sky colours vs the photo,
+// transmittance, scale registry) and sets window.__sceneReady.
+import './../src/env/fog.js';                          // patch the fog chunks before anything compiles
+import * as THREE from 'three';
+import { U, param, SCALE_REGISTRY, curvatureDrop } from '../src/shared.js';
+import { CAMERA_PRESETS, TIME_DEFAULT, SITE, ATMOS, PAINT, QUALITY, LOOK, RENDER } from '../src/config.js';
+import { SimClock } from '../src/env/time.js';
+import { Atmosphere } from '../src/env/atmosphere.js';
+import { COVER_TABLE } from '../src/env/clouds.js';
+import { applyAtmosphere, hasAtmosphere } from '../src/env/fog.js';
+import { DevPost } from './stubs/atmosphere-post.js';
+import { createSeaStandIn } from './stubs/atmosphere-sea.js';
+
+const RAD = Math.PI / 180;
+const W = innerWidth, H = innerHeight;
+
+// ---- renderer (as main.js will: log depth, composer does MSAA)
+const renderer = new THREE.WebGLRenderer({ antialias: false, logarithmicDepthBuffer: true, preserveDrawingBuffer: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(CAMERA_PRESETS.drone.vfovDeg, W / H, RENDER.near, RENDER.far);
+camera.rotation.order = 'YXZ';
+
+// ---- clock
+const [dm, dd] = String(param('date', `${String(TIME_DEFAULT.month).padStart(2, '0')}-${TIME_DEFAULT.day}`)).split('-').map(Number);
+const clock = new SimClock({ month: dm, day: dd, hours: param('time', TIME_DEFAULT.hours), speed: param('speed', 60), playing: param('play', false) });
+const frozen = param('freeze', false);
+U.uTime.value = param('t', 0);
+U.uPolarizer.value = param('pol', 0);
+
+// ---- view
+const drone = CAMERA_PRESETS.drone;
+function setView() {
+  const view = param('view', 'drone');
+  const p = String(param('cam', '')).split(',').map(Number);
+  camera.position.fromArray(p.length === 3 && p.every(Number.isFinite) ? p : drone.position);
+  let heading = drone.headingDeg, pitch = drone.pitchDeg, fov = drone.vfovDeg;
+  const sun = clock.sun(), moon = clock.moon();
+  if (view === 'sun') { heading = sun.azimuthDeg; pitch = Math.min(Math.max(sun.elevationDeg, 1) + 3, 35); fov = 60; }
+  else if (view === 'moon') { heading = moon.azimuthDeg; pitch = Math.min(Math.max(moon.elevationDeg, 1) + 2, 60); fov = 45; }
+  else if (view === 'city') { heading = SITE.atlanticCity.bearingDeg; pitch = 6; fov = 50; }
+  else if (view === 'zenith') { heading = 180; pitch = 60; fov = 90; }
+  else if (view === 'south') { heading = 180; pitch = 20; fov = 70; }
+  else if (view === 'overview') { const o = CAMERA_PRESETS.overview; camera.position.fromArray(o.position); heading = o.headingDeg; pitch = o.pitchDeg; fov = o.vfovDeg; }
+  heading = param('az', heading); pitch = param('el', pitch); fov = param('fov', fov);
+  camera.fov = fov;
+  camera.rotation.set(pitch * RAD, -heading * RAD, 0);
+  camera.updateProjectionMatrix();
+  camera.updateMatrixWorld();
+  return { view, heading, pitch, fov };
+}
+const viewInfo = setView();
+
+// ---- atmosphere
+const quality = QUALITY[param('quality', 'high')] || QUALITY.high;
+const atmosphere = new Atmosphere({ renderer, scene, camera, quality, clock });
+if (param('clouds', null) !== null) atmosphere.setClouds({ cover: param('clouds', 0.28) });
+
+// ---- sea stand-in + test posts (white tower + yellow transition piece) along the drone heading
+// debug: sea=basic (unlit black: shows pure in-scatter) | sea=none
+const seaMode = param('sea', 'standard');
+if (seaMode !== 'none') {
+  const sea = createSeaStandIn();
+  if (seaMode === 'basic') sea.material = applyAtmosphere(new THREE.MeshBasicMaterial({ color: 0x000000 }));
+  scene.add(sea);
+}
+const white = applyAtmosphere(new THREE.MeshStandardMaterial({ name: 'Dev.White', color: new THREE.Color().fromArray(PAINT.ral9010.lin), roughness: 0.5 }));
+const yellow = applyAtmosphere(new THREE.MeshStandardMaterial({ name: 'Dev.Yellow', color: new THREE.Color().fromArray(PAINT.ral1023.lin), roughness: 0.55 }));
+const towerGeo = new THREE.CylinderGeometry(3.75, 5, 125, 32, 1);
+const tpGeo = new THREE.CylinderGeometry(5.25, 5.25, 21.5, 32, 1);
+const hx = Math.sin(drone.headingDeg * RAD), hz = -Math.cos(drone.headingDeg * RAD);
+const postDistances = [800, 1900, 3000, 6300, 10000, 20000];
+for (const d of postDistances) {
+  const x = drone.position[0] + hx * d, z = drone.position[2] + hz * d, y0 = -curvatureDrop(x, z);
+  const tower = new THREE.Mesh(towerGeo, white); tower.position.set(x, y0 + 21.5 + 62.5, z);
+  const tp = new THREE.Mesh(tpGeo, yellow); tp.position.set(x, y0 + 10.75, z);
+  for (const m of [tower, tp]) { m.castShadow = true; m.receiveShadow = true; scene.add(m); }
+}
+
+// ---- fog-patch coverage: InstancedMesh, additive Sprite (extinction only), Points, IBL spheres
+{
+  const d = 420, a = (drone.headingDeg - 9) * RAD;
+  const bx = drone.position[0] + Math.sin(a) * d, bz = drone.position[2] - Math.cos(a) * d;
+  const inst = new THREE.InstancedMesh(new THREE.BoxGeometry(6, 6, 6), applyAtmosphere(new THREE.MeshStandardMaterial({ color: 0x808080, roughness: 0.6 })), 5);
+  const m4 = new THREE.Matrix4();
+  for (let i = 0; i < 5; i++) { inst.setMatrixAt(i, m4.makeTranslation(bx + i * 14, 4 - curvatureDrop(bx, bz), bz)); inst.setColorAt(i, new THREE.Color().setHSL(i / 5, 0.6, 0.5)); }
+  inst.castShadow = inst.receiveShadow = true;
+  scene.add(inst);
+  const sprite = new THREE.Sprite(applyAtmosphere(new THREE.SpriteMaterial({ color: new THREE.Color(1.0, 0.1, 0.05), blending: THREE.AdditiveBlending, depthWrite: false })));
+  sprite.position.set(bx + 80, 60, bz); sprite.scale.setScalar(8);
+  scene.add(sprite);
+  const pg = new THREE.BufferGeometry();
+  pg.setAttribute('position', new THREE.Float32BufferAttribute([bx + 100, 30, bz, bx + 104, 32, bz, bx + 108, 34, bz], 3));
+  scene.add(new THREE.Points(pg, applyAtmosphere(new THREE.PointsMaterial({ color: 0xffffff, size: 4 }))));
+  const chrome = new THREE.Mesh(new THREE.SphereGeometry(10, 48, 24), applyAtmosphere(new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 1, roughness: 0.05 })));
+  chrome.position.set(bx - 40, 12, bz); chrome.castShadow = true;
+  const matte = new THREE.Mesh(new THREE.SphereGeometry(10, 48, 24), applyAtmosphere(new THREE.MeshPhysicalMaterial({ color: new THREE.Color().fromArray(PAINT.ral7035.lin), roughness: 0.5, clearcoat: 0.2 })));
+  matte.position.set(bx - 70, 12, bz); matte.castShadow = matte.receiveShadow = true;
+  scene.add(chrome, matte);
+  // applyAtmosphere composes with an existing hook (red tint here) and is idempotent.
+  const tinted = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
+  tinted.onBeforeCompile = (sh) => { sh.fragmentShader = sh.fragmentShader.replace('vec4 diffuseColor = vec4( diffuse, opacity );', 'vec4 diffuseColor = vec4( diffuse * vec3( 1.0, 0.25, 0.25 ), opacity );'); };
+  applyAtmosphere(tinted); applyAtmosphere(tinted);
+  const tintBox = new THREE.Mesh(new THREE.BoxGeometry(8, 8, 8), tinted);
+  tintBox.position.set(bx - 100, 6, bz); tintBox.castShadow = true;
+  scene.add(tintBox);
+  // fallback fog path: a built-in fog:true material that was never patched still fades and is pre-exposed
+  const plain = new THREE.Mesh(new THREE.BoxGeometry(8, 8, 8), new THREE.MeshLambertMaterial({ color: 0x40a040 }));
+  plain.position.set(bx - 130, 6, bz);
+  scene.add(plain);
+  window.__atmosTests = { idempotent: tinted.onBeforeCompile === tinted.onBeforeCompile && hasAtmosphere(tinted), cloneLosesHook: !hasAtmosphere(tinted.clone()) };
+}
+
+// ---- transmittance probes (layer 2 only): unlit black/white panels at the SCENE-SPEC check distances
+const PROBE_LAYER = 2;
+const probes = [];
+const probeGeo = new THREE.PlaneGeometry(80, 80);
+const probeWhite = applyAtmosphere(new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide }));
+const probeBlack = applyAtmosphere(new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.DoubleSide }));
+Object.keys(ATMOS.transmittanceCheck).forEach((key, n) => {
+  const d = +key;
+  // each distance at its own bearing so no probe hides another
+  const a = (drone.headingDeg + (n - 2.5) * 5) * RAD, px = Math.sin(a), pz = -Math.cos(a);
+  for (const [side, mat] of [[-1, probeBlack], [1, probeWhite]]) {
+    const ox = -pz * side * 60, oz = px * side * 60;          // side by side, perpendicular to the line of sight
+    const x = drone.position[0] + px * d + ox, z = drone.position[2] + pz * d + oz;
+    const m = new THREE.Mesh(probeGeo, mat);
+    m.position.set(x, -curvatureDrop(x, z) + 12, z);            // TP mid-height: the photo's haze targets are the yellow TPs
+    m.lookAt(camera.position);
+    m.layers.set(PROBE_LAYER);
+    scene.add(m);
+    probes.push({ d, side, mesh: m });
+  }
+});
+
+const post = new DevPost({ renderer, scene, camera, atmosphere }, { anchor: param('exposure', 'rule'), nightGain: param('nightgain', LOOK.nightExposureMaxGain) });
+const hud = document.getElementById('hud');
+if (param('hud', true) === false) hud.style.display = 'none';
+
+// ---- measurements -----------------------------------------------------------------------
+const aces = (() => {
+  // r180 ACESFilmicToneMapping + sRGB OETF, for reading model radiance as display colour.
+  const m1 = [[0.59719, 0.07600, 0.02840], [0.35458, 0.90834, 0.13383], [0.04823, 0.01566, 0.83777]];
+  const m2 = [[1.60475, -0.10208, -0.00327], [-0.53108, 1.10813, -0.07276], [-0.07367, -0.00605, 1.07602]];
+  const mul = (m, v) => [0, 1, 2].map((i) => m[0][i] * v[0] + m[1][i] * v[1] + m[2][i] * v[2]);
+  const rrt = (v) => (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.4329510) + 0.238081);
+  const oetf = (c) => (c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
+  return (rgb, exposure) => {
+    let v = rgb.map((c) => c * exposure / 0.6);
+    v = mul(m1, v).map(rrt);
+    return mul(m2, v).map((c) => Math.round(255 * oetf(Math.min(1, Math.max(0, c)))));
+  };
+})();
+const hex = (c) => '#' + c.map((x) => x.toString(16).padStart(2, '0')).join('');
+
+// Screen row of a true elevation (deg) at the centre column for the current camera.
+function rowForElevation(elDeg) {
+  const v = new THREE.Vector3(Math.sin(viewInfo.heading * RAD) * Math.cos(elDeg * RAD), Math.sin(elDeg * RAD), -Math.cos(viewInfo.heading * RAD) * Math.cos(elDeg * RAD));
+  v.add(camera.position).project(camera);
+  return Math.round((1 - v.y) * 0.5 * H);
+}
+// Photo method (photo-look §6.1): per row, the median of the bluest 15% of pixels (clouds rejected).
+function sampleSkyRow(gl, row, x0, x1) {
+  const w = x1 - x0, px = new Uint8Array(w * 4 * 3);
+  gl.readPixels(x0, H - 1 - row - 1, w, 3, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  const arr = [];
+  for (let i = 0; i < w * 3; i++) arr.push([px[i * 4], px[i * 4 + 1], px[i * 4 + 2]]);
+  arr.sort((a, b) => (b[2] - b[0]) - (a[2] - a[0]));
+  const top = arr.slice(0, Math.max(1, Math.floor(arr.length * 0.15)));
+  const med = (k) => top.map((p) => p[k]).sort((a, b) => a - b)[top.length >> 1];
+  return [med(0), med(1), med(2)];
+}
+function measureProbes() {
+  const rt = new THREE.WebGLRenderTarget(W, H, { type: THREE.FloatType });
+  const cam = camera.clone(); cam.layers.set(PROBE_LAYER);
+  renderer.setRenderTarget(rt); renderer.setClearColor(0x000000, 0); renderer.clear();
+  renderer.render(scene, cam);
+  renderer.setRenderTarget(null);
+  const out = {};
+  const buf = new Float32Array(4);
+  for (const p of probes) {
+    const v = p.mesh.position.clone().project(camera);
+    const x = Math.round((v.x * 0.5 + 0.5) * W), y = Math.round((v.y * 0.5 + 0.5) * H);
+    if (x < 0 || x >= W || y < 0 || y >= H) continue;
+    renderer.readRenderTargetPixels(rt, x, y, 1, 1, buf);
+    (out[p.d] ||= {})[p.side > 0 ? 'white' : 'black'] = [buf[0], buf[1], buf[2]].map((c) => c / atmosphere.preExposure);
+  }
+  rt.dispose();
+  const rows = [];
+  for (const [d, exp] of Object.entries(ATMOS.transmittanceCheck)) {
+    const o = out[d];
+    if (!o || !o.white || !o.black) { rows.push({ d: +d, expected: exp, measured: null }); continue; }
+    const T = [0, 1, 2].map((k) => o.white[k] - o.black[k]);
+    rows.push({ d: +d, expected: exp, measuredG: +T[1].toFixed(3), measuredRGB: T.map((t) => +t.toFixed(3)), inscatterG: +o.black[1].toExponential(3) });
+  }
+  return rows;
+}
+
+// Clear-sky model radiance (sky-view LUT, no clouds) at exact true elevations in an azimuth,
+// shown as display sRGB with the current exposure: the photo-look §6.1 comparison without cloud
+// contamination.
+const SKY_PROBE_EL = [0.4, 0.8, 2.8, 5, 7.8, 10, 12.6, 20, 30, 45, 60, 90];
+const skyProbe = (() => {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: Object.assign({}, atmosphere.uniforms, { uEl: { value: SKY_PROBE_EL.map((e) => e * RAD) }, uAz: { value: 0 } }),
+    vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy * 2.0, 0.0, 1.0); }',
+    fragmentShader: `${atmosphere.glsl}
+      uniform float uEl[${SKY_PROBE_EL.length}]; uniform float uAz; varying vec2 vUv;
+      void main() {
+        int i = int(gl_FragCoord.x);
+        float el = uEl[i];
+        vec3 d = vec3(sin(uAz) * cos(el), sin(el), -cos(uAz) * cos(el));
+        gl_FragColor = vec4(gl_FragCoord.y < 1.0 ? atmSkyLUTSample(d).rgb : skyRadiance(d), 1.0);
+      }`,
+    depthTest: false, depthWrite: false,
+  });
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+  quad.frustumCulled = false;
+  const sc = new THREE.Scene(); sc.add(quad);
+  const rt = new THREE.WebGLRenderTarget(SKY_PROBE_EL.length, 2, { type: THREE.FloatType });
+  return (azDeg) => {
+    mat.uniforms.uAz.value = azDeg * RAD;
+    renderer.setRenderTarget(rt); renderer.render(sc, camera); renderer.setRenderTarget(null);
+    const buf = new Float32Array(SKY_PROBE_EL.length * 2 * 4);
+    renderer.readRenderTargetPixels(rt, 0, 0, SKY_PROBE_EL.length, 2, buf);
+    const out = {};
+    SKY_PROBE_EL.forEach((el, i) => {
+      const c = [buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2]];
+      const cc = [buf[(SKY_PROBE_EL.length + i) * 4], buf[(SKY_PROBE_EL.length + i) * 4 + 1], buf[(SKY_PROBE_EL.length + i) * 4 + 2]];
+      const e = post.exposure;
+      out[el] = { L: c.map((x) => +x.toExponential(3)), clear: hex(aces(c, e)), withClouds: hex(aces(cc, e)), Yexposed: +(e * (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])).toFixed(3) };
+    });
+    return out;
+  };
+})();
+
+// Cost of the sky dome (perf=1): the dome alone rendered into a 1600x900-equivalent half-float
+// target in batches, wall time with gl.finish, minimum over batches (the GPU is shared, so the
+// minimum is the least contended estimate), minus the same for an empty scene. Plus CPU time of
+// atmosphere.update and the cost of a sky-LUT rebuild and a full environment bake.
+async function measurePerf() {
+  const gl = renderer.getContext();
+  const rt = new THREE.WebGLRenderTarget(W, H, { type: THREE.HalfFloatType });
+  const px = new Uint16Array(4);
+  const sync = () => { renderer.readRenderTargetPixels(rt, 0, 0, 1, 1, px); };   // readPixels waits for the GPU
+  const skyScene = new THREE.Scene(), emptyScene = new THREE.Scene();
+  const dome = new THREE.Mesh(atmosphere.skyMesh.geometry, atmosphere.skyMaterial);
+  dome.scale.copy(atmosphere.skyMesh.scale); dome.position.copy(camera.position); dome.frustumCulled = false;
+  skyScene.add(dome);
+  const batch = (sc, n) => {
+    renderer.setRenderTarget(rt);
+    sync();
+    const t0 = performance.now();
+    for (let i = 0; i < n; i++) renderer.render(sc, camera);
+    sync();
+    renderer.setRenderTarget(null);
+    return (performance.now() - t0) / n;
+  };
+  batch(skyScene, 3); batch(emptyScene, 3);
+  let sky = Infinity, empty = Infinity;
+  for (let b = 0; b < 12; b++) {
+    sky = Math.min(sky, batch(skyScene, 10));
+    empty = Math.min(empty, batch(emptyScene, 10));
+    await new Promise((r) => setTimeout(r, 30));
+  }
+  let pre = Infinity;
+  for (let b = 0; b < 12; b++) {
+    const syncPre = () => sync();
+    syncPre(); const tp = performance.now();
+    for (let i = 0; i < 10; i++) atmosphere._renderCloudScreen(camera, camera.position, false);   // one frame's quarter march + resolve
+    syncPre(); pre = Math.min(pre, (performance.now() - tp) / 10);
+    await new Promise((r) => setTimeout(r, 30));
+  }
+  let t0 = performance.now();
+  for (let i = 0; i < 50; i++) atmosphere.update(0.016, U.uTime.value, camera);
+  const cpuSteady = (performance.now() - t0) / 50;
+  let lut = Infinity;
+  for (let i = 0; i < 6; i++) {
+    sync(); t0 = performance.now();
+    atmosphere._lastSky.h = -1; atmosphere.update(0.016, U.uTime.value, camera);
+    sync(); lut = Math.min(lut, performance.now() - t0);
+  }
+  let env = Infinity;
+  for (let i = 0; i < 4; i++) {
+    sync(); t0 = performance.now();
+    atmosphere._bakeEnvironmentNow(camera.position); sync();
+    env = Math.min(env, performance.now() - t0);
+  }
+  rt.dispose();
+  return { skyDomeMs: +(sky - empty).toFixed(3), cloudPassMs: +pre.toFixed(3), avgPerFrameGpuMs: +(sky - empty + pre).toFixed(3), emptyPassMs: +empty.toFixed(3), atmosphereUpdateCpuMs: +cpuSteady.toFixed(3),
+    skyLutRebuildMs: +lut.toFixed(2), envFullBakeMs: +env.toFixed(2), note: 'min over batches, wall time to a readPixels sync, shared GPU' };
+}
+
+function report() {
+  const s = clock.sun(), m = clock.moon();
+  const Es = U.uSunIlluminance.value;
+  const hr = atmosphere.horizonRadiance;
+  const out = {
+    time: clock.label(), view: viewInfo,
+    sun: { az: +s.azimuthDeg.toFixed(3), el: +s.elevationDeg.toFixed(3) },
+    moon: { az: +m.azimuthDeg.toFixed(2), el: +m.elevationDeg.toFixed(2), phase: +m.phase.toFixed(3), k: +m.illuminatedFraction.toFixed(3) },
+    E_sun: [Es.r, Es.g, Es.b].map((c) => +c.toFixed(4)), E_sun_lux: Math.round((0.2126 * Es.r + 0.7152 * Es.g + 0.0722 * Es.b) * LOOK.sceneUnitLux),
+    L_horizon: [hr.r, hr.g, hr.b].map((c) => +c.toExponential(4)),
+    horizonOverSun: +atmosphere.horizonToSunRatio.toFixed(4),
+    exposureTarget: +atmosphere.exposureTarget.toPrecision(4), exposureTargetPhotoFit: +atmosphere.exposureTargetPhotoFit.toPrecision(4), exposureUsed: +post.exposure.toPrecision(4), preExposure: +atmosphere.preExposure.toPrecision(4),
+    expectedHorizonDisplay: hex(aces([hr.r, hr.g, hr.b], atmosphere.exposureTarget)),
+  };
+  // Ephemeris check (SCENE-SPEC §8): 2026-06-21 16:30 EDT puts the sun at az 266.59 / el 42.97 at the hero.
+  const ref = new SimClock({ year: 2026, month: 6, day: 21, hours: 16.5 }).sun();
+  out.assertSunEphemeris = Math.abs(ref.azimuthDeg - 266.59) < 0.01 && Math.abs(ref.elevationDeg - 42.97) < 0.01 ? 'PASS' : 'FAIL';
+  if (clock.date.month === TIME_DEFAULT.month && clock.date.day === TIME_DEFAULT.day && Math.abs(clock.hours - TIME_DEFAULT.hours) < 1e-9) {
+    out.assertHorizonOverSunBand = out.horizonOverSun >= LOOK.horizonOverSunSanity[0] && out.horizonOverSun <= LOOK.horizonOverSunSanity[1] ? 'PASS' : 'FAIL';
+  }
+  return out;
+}
+
+// ---- loop
+const timer = new THREE.Timer();
+timer.connect(document);
+let frames = 0, ready = false, fpsT0 = performance.now(), fpsN = 0, fps = 0;
+renderer.setAnimationLoop((now) => {
+  timer.update(now);
+  const dt = Math.min(0.1, timer.getDelta());
+  if (!frozen) U.uTime.value += dt;
+  clock.update(dt);
+  atmosphere.update(dt, U.uTime.value, camera);
+  renderer.info.reset();
+  post.render(dt, { snap: frames < 3 });
+  frames++; fpsN++;
+  if (now - fpsT0 > 1000) { fps = fpsN * 1000 / (now - fpsT0); fpsN = 0; fpsT0 = now; }
+  hud.textContent = `${clock.label()}  sun ${atmosphere.sunElevationDeg.toFixed(2)}°  moon ${atmosphere.moonElevationDeg.toFixed(1)}°  exp ${post.exposure.toPrecision(3)} pre ${atmosphere.preExposure.toPrecision(3)}  ${fps.toFixed(0)} fps`;
+  if (!ready && frames === 4) {
+    ready = true;
+    const gl = renderer.getContext();
+    const rep = report();
+    if (viewInfo.view === 'drone' && param('az', null) === null) {
+      const x0 = Math.round(W * 0.55), x1 = Math.round(W * 0.95);
+      rep.skyDisplay = {};
+      for (const [label, el, target] of [['horizon(0.4)', 0.4, '#e5ecf5'], ['5deg', 5, '#d4e5f6'], ['10deg', 10, '#b2d5f2'], ['12.6deg', 12.6, '#9fcaeb']]) {
+        const row = rowForElevation(el);
+        if (row > 1 && row < H - 3) rep.skyDisplay[label] = { row, got: hex(sampleSkyRow(gl, row, x0, x1)), photo: target };
+      }
+    }
+    if (param('probe', false)) rep.transmittance = measureProbes();
+    rep.skyModel = skyProbe(viewInfo.heading);
+    rep.photoTargets = { '0.4': '#e5ecf5 (Yexp 1.43)', '5': '#d4e5f6', '10': '#b2d5f2 (Yexp 0.68)', '12.6': '#9fcaeb (Yexp 0.53)' };
+    rep.fogTests = window.__atmosTests;
+    if (param('calibrate', false)) { const t0 = performance.now(); rep.coverTable = { baked: COVER_TABLE, derived: atmosphere.deriveCoverTable(), ms: Math.round(performance.now() - t0) }; }
+    const ps = atmosphere.cloudPatchStats;
+    rep.cloudPatches = { projectedCover: +ps.cover.toFixed(3), count: ps.count, over300m: ps.countOver300m, median: Math.round(ps.median), p10: Math.round(ps.p10), p90: Math.round(ps.p90) };
+    rep.scale = SCALE_REGISTRY.filter((e) => /^(clouds|sun|moon)\./.test(e.name)).map((e) => { const m = e.measure(); return { name: e.name, measured: +(m[e.expect.axis]).toPrecision(6), expect: e.expect.metres, ok: Math.abs(m[e.expect.axis] - e.expect.metres) <= e.expect.tolerance }; });
+    const finish = () => { console.log('ATMOS_REPORT ' + JSON.stringify(rep)); window.__sceneReady = true; };
+    if (param('perf', false)) measurePerf().then((p) => { rep.perf = p; finish(); });
+    else finish();
+  }
+  window.__sceneStats = { fps, frameMs: 1000 / Math.max(fps, 1e-3), drawCalls: renderer.info.render.calls, triangles: renderer.info.render.triangles, programs: renderer.info.programs.length, geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures };
+});
+window.__scene = {
+  atmosphere, clock, camera,
+  setTime: (h) => clock.setTime(h), setDate: (m, d) => clock.setDate(m, d), play: (b) => clock.play(b), setSpeed: (x) => { clock.speed = x; },
+  setClouds: (c) => atmosphere.setClouds({ cover: c }), report,
+};
+</script>
+</body>
+</html>

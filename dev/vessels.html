@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vessels dev</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; }
+  #hud { position: fixed; left: 8px; top: 8px; color: #fff; font: 11px/1.35 ui-monospace, Menlo, monospace; text-shadow: 0 0 3px #000; white-space: pre; pointer-events: none; }
+</style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<div id="hud"></div>
+<script type="module">
+// Dev page for src/life/vessels.js and src/env/land.js on the real atmosphere, ocean and post chain.
+//   ?view=transit|ctvclose|landing|landingdeck|landingside|landingnight|sov|sovnight|skyline|skylinewide|ctvnight|drone|overview
+//   ctvclose / sov camera: ?rel=<deg from the bow> ?range=<m> ?height=<m> ?fov=<deg> (?seek=hero|partner|transit|approach)
+//   landingdeck: ?pitch=<deg>   ?time=16.5  ?date=06-21  ?t=<animation s>  ?warm=150 (fixed 1/60 s frames before the shot)
+//   ?farm=1 (the real Farm instead of the stand-in hero TP)  ?quality=high  ?hud=0  ?play=1 (keep running after the shot)
+//   ?bench=1 (GPU timer-query cost per part + CPU update cost; unreliable while other agents load the GPU)
+import '../src/env/fog.js';                                   // patches the fog chunks before anything compiles
+import * as THREE from 'three';
+import { U, SCALE_REGISTRY, param, azimuthToDir, curvatureDrop } from '../src/shared.js';
+import { CAMERA_PRESETS, QUALITY, RENDER, SEA, SCALE_TABLE, TIME_DEFAULT, TURBINE } from '../src/config.js';
+import { SimClock } from '../src/env/time.js';
+import { Atmosphere } from '../src/env/atmosphere.js';
+import { Ocean } from '../src/ocean/ocean.js';
+import { Post } from '../src/post/post.js';
+import { Land } from '../src/env/land.js';
+import { Vessels } from '../src/life/vessels.js';
+import { buildHeroStandIn } from './stubs/vessels-hero.js';
+
+const DEG = Math.PI / 180;
+const VIEW = param('view', 'transit');
+const DEFAULT_TIME = { skyline: 16.5, skylinewide: 16.5, ctvnight: 23.0, sovnight: 23.0, landingnight: 23.0 };
+const quality = QUALITY[param('quality', 'high')] || QUALITY.high;
+const WARM = param('warm', 150);
+U.uTime.value = param('t', 0);
+
+// ---------------------------------------------------------------- renderer, scene, camera
+const renderer = new THREE.WebGLRenderer({ antialias: false, logarithmicDepthBuffer: RENDER.logarithmicDepthBuffer, powerPreference: 'high-performance', stencil: false });
+renderer.setPixelRatio(1);
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.info.autoReset = false;
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0xffffff, RENDER.far, 2 * RENDER.far);
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, RENDER.near, RENDER.far);
+camera.rotation.order = 'YXZ';
+scene.add(camera);
+
+// ---------------------------------------------------------------- modules (main.js construction order)
+const [dm, dd] = String(param('date', `${TIME_DEFAULT.month}-${TIME_DEFAULT.day}`)).split('-').map(Number);
+const ctx = { renderer, scene, camera, quality, seed: 1 };
+ctx.clock = new SimClock({ year: TIME_DEFAULT.year, month: dm, day: dd, hours: param('time', DEFAULT_TIME[VIEW] ?? TIME_DEFAULT.hours), speed: 1, playing: false });
+camera.position.set(-649.5, 127.5, 420.9);
+ctx.atmosphere = new Atmosphere(ctx);
+const tLand = performance.now();
+ctx.land = new Land(ctx);
+const landBuildMs = performance.now() - tLand;
+ctx.ocean = new Ocean(ctx);
+ctx.ocean.setSeaState({ windSpeed: param('wind', SEA.windSpeed), windFromDeg: SEA.windFromDeg }, { immediate: true });
+if (param('farm', false)) {
+  const { Farm } = await import('../src/farm/farm.js');
+  ctx.farm = new Farm(ctx);
+} else {
+  buildHeroStandIn(ctx);
+}
+const tVes = performance.now();
+ctx.vessels = new Vessels(ctx);
+const vesselsBuildMs = performance.now() - tVes;
+ctx.post = new Post(ctx);
+const vessels = ctx.vessels, ctv = vessels.ctv, sov = vessels.sov;
+
+// ---------------------------------------------------------------- views
+const V3 = (x, y, z) => new THREE.Vector3(x, y, z);
+function aim(pos, target, fov) {
+  camera.position.copy(pos); camera.fov = fov; camera.up.set(0, 1, 0); camera.lookAt(target);
+  camera.rotation.reorder('YXZ');
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); camera.updateMatrixWorld();
+}
+function preset(p) {
+  camera.position.fromArray(p.position);
+  camera.rotation.set(p.pitchDeg * DEG, -p.headingDeg * DEG, 0, 'YXZ');
+  camera.fov = p.vfovDeg; camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); camera.updateMatrixWorld();
+}
+// Camera relative to the CTV's current pose: bearing offset from its heading, horizontal range, height.
+function followCtv(relBearing, range, height, fov, lookUp = 1.5) {
+  const P = ctv.pose, f = ctv.focus(V3());
+  const d = azimuthToDir(P.heading + relBearing);
+  aim(V3(P.x + d.x * range, height - curvatureDrop(P.x, P.z), P.z + d.z * range), f.setY(f.y + lookUp - 1.5), fov);
+}
+const SEEK = { ctvclose: param('seek', 'hero'), transit: 'transit', landing: 'hero', landingdeck: 'hero', landingside: 'hero', ctvnight: 'transit', landingnight: 'hero', drone: null, overview: null };
+if (SEEK[VIEW]) ctv.seek(SEEK[VIEW], U.uTime.value);
+function placeCamera() {
+  switch (VIEW) {
+    case 'transit': followCtv(param('rel', -125), 52, 30, 40); break;               // port (sunlit) quarter, 60 m slant range
+    case 'ctvnight': followCtv(55, 110, 14, 35); break;                              // starboard bow: masthead + green sidelight
+    case 'ctvclose': followCtv(param('rel', 35), param('range', 26), param('height', 4), param('fov', 45), param('look', 1.5)); break;   // model close-ups
+    case 'landing': preset(CAMERA_PRESETS.deck); break;
+    case 'landingdeck': preset({ ...CAMERA_PRESETS.deck, pitchDeg: param('pitch', 4), vfovDeg: 62 }); break;   // same eye, looking along the foredeck
+    case 'landingnight': case 'landingside': {
+      const p = azimuthToDir(TURBINE.boatLanding.facingDeg + 70).multiplyScalar(38);
+      aim(V3(p.x, 9, p.z), V3(azimuthToDir(TURBINE.boatLanding.facingDeg).x * 14, 4, azimuthToDir(TURBINE.boatLanding.facingDeg).z * 14), 45);
+      break;
+    }
+    case 'sov': case 'sovnight': {
+      // starboard bow quarter: the gangway spans from the tower to the turbine platform
+      const f = sov.focus(V3()), d = azimuthToDir(sov.pose.heading + param('rel', 55)), R = param('range', 2000);
+      aim(V3(f.x + d.x * R, 30 - curvatureDrop(f.x + d.x * R, f.z + d.z * R), f.z + d.z * R), f.setY(f.y + 4), param('fov', 5));
+      break;
+    }
+    case 'skyline': aim(V3(-649.5, 127.5, 420.9), V3(-649.5, 127.5, 420.9).add(azimuthToDir(302.7).multiplyScalar(20000)).setY(127.5 - 20000 * Math.tan(0.36 * DEG) + 20), 8); break;
+    case 'skylinewide': { const p = { ...CAMERA_PRESETS.drone, headingDeg: 302.7, pitchDeg: -1.2 }; preset(p); break; }
+    case 'overview': preset(CAMERA_PRESETS.overview); break;
+    default: preset(CAMERA_PRESETS.drone);
+  }
+  ctx.atmosphere.setShadowFocus(/^(landing|transit|ctvnight|ctvclose)/.test(VIEW) ? ctv.focus(V3()).setY(40) : V3(0, 130, 0));
+}
+placeCamera();
+
+// ---------------------------------------------------------------- loop
+const hud = document.getElementById('hud');
+if (!param('hud', true)) hud.style.display = 'none';
+let hold = false, vesselsHidden = false;
+function step(dt) {
+  if (hold) dt = 0;
+  U.uTime.value += dt;
+  const t = U.uTime.value;
+  renderer.info.reset();
+  if (!param('fixcam', false)) placeCamera();
+  U.uCameraPos.value.copy(camera.position);
+  ctx.atmosphere.update(dt, t, camera);
+  if (!vesselsHidden) { ctx.land.update(dt, t, camera); ctx.farm?.update(dt, t, camera); vessels.update(dt, t, camera); }
+  ctx.ocean.update(dt, t, camera);
+}
+// warm-up: WARM frames of 1/60 s ending at the requested animation time (wakes, spray, seakeeping settle)
+if (WARM > 0) {
+  const target = U.uTime.value;
+  U.uTime.value = target - WARM / 60;
+  if (SEEK[VIEW]) ctv.seek(SEEK[VIEW], target);
+  for (let i = 0; i < WARM; i++) step(1 / 60);
+}
+renderer.setRenderTarget(ctx.post.sceneTarget);
+await renderer.compileAsync(scene, camera);
+renderer.setRenderTarget(null);
+let frames = 0;
+function frame() {
+  step(1 / 60);
+  ctx.post.render(1 / 60, { snap: frames < 3 });
+  frames++;
+  if (frames === 4) onReady();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------------------------------------------------------------- report
+const r = (v, n = 2) => (Number.isFinite(v) ? +v.toFixed(n) : v);
+function scaleRows() {
+  return SCALE_REGISTRY.filter((e) => /^(ctv|sov|land)\./.test(e.name)).map((e) => {
+    const m = e.measure(), ax = e.expect?.axis ?? 'x';
+    const v = typeof m === 'number' ? m : (ax === 'max' ? Math.max(m.x, m.y, m.z) : m[ax]);
+    const ref = SCALE_TABLE[e.name] || e.expect;
+    return { name: e.name, measured: r(v, 3), expected: ref?.metres, tol: ref?.tolerance, ok: ref ? Math.abs(v - ref.metres) <= ref.tolerance + 1e-9 : null };
+  });
+}
+// GPU cost of each part, from EXT_disjoint_timer_query_webgl2 (GPU time of the commands only, so
+// other agents sharing the GPU matter much less): the scene rendered (shadow pass included) into an
+// MSAA HalfFloat target the size of the composer's, and the ocean's mirror pass, with each part
+// shown vs hidden; median over interleaved repeats.
+async function bench(repeats = 16) {
+  const gl = renderer.getContext(), ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+  if (!ext) return { error: 'no EXT_disjoint_timer_query_webgl2' };
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  const rt = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: quality.msaa });
+  const draw = () => { renderer.setRenderTarget(rt); renderer.render(scene, camera); renderer.setRenderTarget(null); };
+  const mirror = () => ctx.ocean.reflection.render(scene, camera, -curvatureDrop(camera.position.x, camera.position.z));
+  const parts = {
+    none: [], spray: [vessels.spray.mesh], decal: [vessels.decal.mesh], lamps: [vessels.lamps.mesh], ctv: [ctv.group],
+    sov: [sov.group, sov.gangwayOuter, sov.gangwayInner], land: [ctx.land.root], all: [vessels.root, ctx.land.root],
+  };
+  const pending = [];
+  const timed = (key, fn) => { const q = gl.createQuery(); gl.beginQuery(ext.TIME_ELAPSED_EXT, q); fn(); gl.endQuery(ext.TIME_ELAPSED_EXT); pending.push({ key, q }); };
+  draw(); mirror();
+  for (let k = 0; k < repeats; k++) {
+    for (const [name, objs] of Object.entries(parts)) {
+      const saved = objs.map((o) => o.visible); objs.forEach((o) => { o.visible = false; });
+      timed(`draw:${name}`, draw);
+      if (name === 'none' || name === 'all') timed(`mirror:${name}`, mirror);
+      objs.forEach((o, i) => { o.visible = saved[i]; });
+    }
+    await new Promise((res) => requestAnimationFrame(res));
+  }
+  const res = {};
+  for (let tries = 0; tries < 200 && pending.some((p) => !p.done); tries++) {
+    await new Promise((r2) => setTimeout(r2, 20));
+    for (const p of pending) {
+      if (p.done || !gl.getQueryParameter(p.q, gl.QUERY_RESULT_AVAILABLE)) continue;
+      p.done = true;
+      if (!gl.getParameter(ext.GPU_DISJOINT_EXT)) (res[p.key] ||= []).push(gl.getQueryParameter(p.q, gl.QUERY_RESULT) / 1e6);
+      gl.deleteQuery(p.q);
+    }
+  }
+  rt.dispose();
+  const med = (a) => { const b = [...(a || [NaN])].sort((x, y) => x - y); return b[Math.floor(b.length / 2)]; };
+  const out = { gpuSceneMs: r(med(res['draw:none']), 3), gpuMirrorMs: r(med(res['mirror:none']), 3) };
+  for (const name of Object.keys(parts)) if (name !== 'none') out[`gpu_${name}`] = r(med(res['draw:none']) - med(res[`draw:${name}`]), 3);
+  out.gpuMirror_all = r(med(res['mirror:none']) - med(res['mirror:all']), 3);
+  let t = vessels._lastT;
+  for (let i = 0; i < 120; i++) { t += 1 / 60; vessels.update(1 / 60, t, camera); }   // JIT warm-up
+  const t1 = performance.now();
+  for (let i = 0; i < 300; i++) { t += 1 / 60; vessels.update(1 / 60, t, camera); }
+  out.cpu_vesselsUpdateMs = r((performance.now() - t1) / 300, 3);
+  const t2 = performance.now();
+  for (let i = 0; i < 300; i++) ctx.land.update(1 / 60, t, camera);
+  out.cpu_landUpdateMs = r((performance.now() - t2) / 300, 3);
+  return out;
+}
+async function onReady() {
+  const P = ctv.pose;
+  const report = {
+    view: VIEW, time: ctx.clock.hours, t: r(U.uTime.value, 2), sunEl: r(ctx.atmosphere.sunElevationDeg),
+    ctv: { phase: ctv.phase, x: r(P.x, 1), z: r(P.z, 1), heading: r(P.heading, 1), speed: r(P.speed), heave: r(ctv.sea.state.heave[0], 3), pitchDeg: r(ctv.sea.state.pitch[0] / DEG), rollDeg: r(ctv.sea.state.roll[0] / DEG) },
+    sov: { x: r(sov.pose.x, 1), z: r(sov.pose.z, 1), gangwayLength: r(sov.gangwayLength, 2), rollDeg: r(sov.sea.state.roll[0] / DEG), pitchDeg: r(sov.sea.state.pitch[0] / DEG) },
+    route: vessels.routeInfo, kelvinDeg: r(vessels.kelvinHalfAngleDeg), lampLevels: vessels.lamps.levels, landLamps: ctx.land.lampCounts, coast: ctx.land.coastStats,
+    build: { landMs: r(landBuildMs, 1), vesselsMs: r(vesselsBuildMs, 1) },
+    render: { calls: renderer.info.render.calls, triangles: renderer.info.render.triangles, programs: renderer.info.programs.length, exposure: r(ctx.post.exposure, 3) },
+    scales: scaleRows(),
+    buildings: ctx.land.buildings.slice(0, 6).map((b) => ({ name: b.name, d: r(b.distanceM, 0), brg: r(b.bearingDeg, 1) })),
+  };
+  if (param('bench', false)) { hold = true; report.bench = await bench(); }
+  console.log('VESSELS_REPORT ' + JSON.stringify(report));
+  window.__vesselsReport = report;
+  hud.textContent = `${VIEW}  ${ctv.phase.kind} ${ctv.phase.landing ?? ''}  v=${r(P.speed, 1)} m/s  calls ${report.render.calls}`;
+  hold = !param('play', false);
+  window.__sceneReady = true;
+}
+window.__vessels = vessels;
+window.__ctx = ctx;
+</script>
+</body>
+</html>

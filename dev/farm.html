@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Farm dev</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; }
+  #overlay { position: fixed; inset: 0; pointer-events: none; }
+  #hud { position: fixed; left: 8px; top: 8px; color: #fff; font: 11px/1.35 ui-monospace, Menlo, monospace; text-shadow: 0 0 3px #000; white-space: pre; pointer-events: none; }
+</style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<canvas id="overlay"></canvas>
+<div id="hud"></div>
+<script type="module">
+// Dev page for src/farm/farm.js on the real atmosphere, ocean and post chain.
+//   ?view=drone|overview|nacelle|hero|tower|idle|substation|reflect|lods|id (?idof=F01)   ?time=16.5  ?date=06-21
+//   ?freeze=1&t=0 (animation time; the hero rotor sits at the 50° reference phase at t = 0)
+//   ?wind=4.5  ?winddir=200.5  ?photo=1  ?adls=1  ?quality=high  ?seed=1  ?overlay=1 (§20 item 7 markers)
+//   ?ocean=0 (no sea: isolates the farm)  ?hud=0  ?bench=wall|gpu (see "benches" below)
+//   ?only=<regex> (show only the farm children whose name matches)
+import '../src/env/fog.js';                                   // patches the fog chunks before anything compiles
+import * as THREE from 'three';
+import { U, SCALE_REGISTRY, param, azimuthToDir, curvatureDrop } from '../src/shared.js';
+import { CAMERA_PRESETS, QUALITY, RENDER, SEA, SCALE_TABLE, TIME_DEFAULT, SUBSTATION, TURBINE } from '../src/config.js';
+import { SimClock } from '../src/env/time.js';
+import { Atmosphere } from '../src/env/atmosphere.js';
+import { Ocean } from '../src/ocean/ocean.js';
+import { Post } from '../src/post/post.js';
+import { Farm } from '../src/farm/farm.js';
+
+const DEG = Math.PI / 180;
+const VIEW = param('view', 'drone');
+const FROZEN = param('freeze', false);
+U.uTime.value = param('t', 0);
+const quality = QUALITY[param('quality', 'high')] || QUALITY.high;
+
+// ---------------------------------------------------------------- renderer, scene, camera
+const renderer = new THREE.WebGLRenderer({ antialias: false, logarithmicDepthBuffer: RENDER.logarithmicDepthBuffer, powerPreference: 'high-performance', stencil: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, quality.pixelRatio));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.info.autoReset = false;
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0xffffff, RENDER.far, 2 * RENDER.far);
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, RENDER.near, RENDER.far);
+camera.rotation.order = 'YXZ';
+scene.add(camera);
+
+// ---------------------------------------------------------------- modules (construction order of main.js)
+const [dm, dd] = String(param('date', `${TIME_DEFAULT.month}-${TIME_DEFAULT.day}`)).split('-').map(Number);
+const ctx = { renderer, scene, camera, quality, seed: param('seed', 1) };
+ctx.clock = new SimClock({ year: TIME_DEFAULT.year, month: dm, day: dd, hours: param('time', TIME_DEFAULT.hours), speed: 1, playing: false });
+placeCamera(VIEW, null);                                       // a first pose for the atmosphere's constructor
+ctx.atmosphere = new Atmosphere(ctx);
+if (param('ocean', true)) {
+  ctx.ocean = new Ocean(ctx);
+  ctx.ocean.setSeaState({ windSpeed: param('wind', SEA.windSpeed), windFromDeg: param('winddir', SEA.windFromDeg) }, { immediate: true });
+}
+const tBuild = performance.now();
+const farm = new Farm(ctx);
+const buildMs = performance.now() - tBuild;
+ctx.farm = farm;
+window.__farm = farm;                                          // dev inspection hook
+farm.setWind(param('wind', SEA.windSpeed), param('winddir', SEA.windFromDeg));
+farm.setPhotoLook(param('photo', false));
+farm.setADLS(param('adls', false));
+ctx.post = new Post(ctx);
+placeCamera(VIEW, farm);
+
+// ---------------------------------------------------------------- views
+function preset(p) {
+  camera.position.fromArray(p.position);
+  camera.rotation.set(p.pitchDeg * DEG, -p.headingDeg * DEG, 0, 'YXZ');
+  camera.fov = p.vfovDeg;
+}
+function aim(pos, target, fov) {
+  camera.position.copy(pos); camera.fov = fov; camera.up.set(0, 1, 0); camera.lookAt(target);
+  camera.rotation.reorder('YXZ');
+}
+function placeCamera(view, f) {
+  const V = (x, y, z) => new THREE.Vector3(x, y, z);
+  let focus = V(0, 130, 0);
+  switch (view) {
+    case 'overview': preset(CAMERA_PRESETS.overview); break;
+    case 'nacelle': preset(CAMERA_PRESETS.nacelle); break;
+    case 'hero': {                                   // hero nacelle roof from 60 m, lights up close
+      const c = V(0, 158, 0);
+      aim(c.clone().add(azimuthToDir(SEA.windFromDeg + 150).multiplyScalar(60)).setY(172), c, 40);
+      focus = c; break;
+    }
+    case 'tower': {                                  // the hero from 420 m at 60 m height: L-810 + lanterns
+      aim(V(0, 60, 0).add(azimuthToDir(236).multiplyScalar(420)), V(0, 70, 0), 45); break;
+    }
+    case 'idle': {
+      const t = f?.turbines.find((x) => x.idle);
+      const c = t ? V(t.x, t.baseY + 150, t.z) : V(0, 150, 0);
+      aim(c.clone().add(azimuthToDir(SEA.windFromDeg + 35).multiplyScalar(330)).setY(t ? t.baseY + 130 : 130), c, 45);
+      focus = c; break;
+    }
+    case 'substation': {
+      const [sx, sz] = SUBSTATION.position, c = V(sx, -curvatureDrop(sx, sz) + 35, sz);
+      aim(c.clone().add(azimuthToDir(236).multiplyScalar(260)).setY(c.y + 45), c, 45);
+      focus = c; break;
+    }
+    case 'reflect': {                                // low over the sea, looking into the array
+      aim(V(-350, 18, 240), V(3000, 60, -900), 50); break;
+    }
+    case 'id': {                                     // one painted-ID patch face-on (?idof=F01, patch azimuth 254)
+      const t = f?.turbines.find((x) => x.id === param('idof', 'F01'));
+      const c = t ? V(t.x, t.baseY + 12.5, t.z) : V(0, 12.5, 0);
+      aim(c.clone().add(azimuthToDir(254).multiplyScalar(26)).setY(c.y + 1.5), c, 40);
+      focus = c; break;
+    }
+    case 'lods': {                                   // along the hero row from 700 m: LOD 0/1/2 in one frame
+      aim(V(-700, 180, 60), V(6000, 90, -1000), 40); break;
+    }
+    default: preset(CAMERA_PRESETS.drone);
+  }
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  camera.updateMatrixWorld();
+  if (ctx.atmosphere) ctx.atmosphere.setShadowFocus(nearestShadowFocus(f, focus));
+}
+// Shadow focus on the turbine nearest the framed point (as main.js does), else the point itself.
+function nearestShadowFocus(f, p) {
+  let best = null, bd = 1500;
+  for (const t of f?.turbines ?? []) { const d = Math.hypot(t.x - p.x, t.z - p.z); if (d < bd) { bd = d; best = t; } }
+  return best ? new THREE.Vector3(best.x, best.baseY + 130, best.z) : p.clone();
+}
+
+// ---------------------------------------------------------------- checks
+const round = (v, n = 1) => +v.toFixed(n);
+function pixelChecks() {
+  // SCENE-SPEC §20 items 7 and 8 at the drone preset, 760 x 506: waterline point of each turbine.
+  const p = CAMERA_PRESETS.drone;
+  const cam = new THREE.PerspectiveCamera(p.vfovDeg, 760 / 506, RENDER.near, RENDER.far);
+  cam.position.fromArray(p.position); cam.rotation.set(p.pitchDeg * DEG, -p.headingDeg * DEG, 0, 'YXZ');
+  cam.updateMatrixWorld(); cam.updateProjectionMatrix();
+  const px = (v) => { const q = v.clone().project(cam); return [round((q.x + 1) / 2 * 760), round((1 - q.y) / 2 * 506)]; };
+  const targets = [[1, 0, 578, 266], [2, 0, 639, 243], [3, 0, 667, 233], [4, 0, 684, 226], [5, 0, 695, 222], [2, -1, 183, 234], [3, -1, 305, 227], [4, -1, 383, 223]];
+  const rows = targets.map(([di, dj, tx, ty]) => {
+    const t = farm.turbines.find((u) => u.di === di && u.dj === dj);
+    const [x, y] = px(new THREE.Vector3(t.x, t.baseY, t.z));
+    return { id: t.id, di, dj, x, y, target: [tx, ty], ok: Math.abs(x - tx) <= 2 && Math.abs(y - ty) <= 2 };
+  });
+  const sub = farm.substation;
+  const box = new THREE.Box3().setFromObject(sub);
+  const topsideTop = new THREE.Vector3(sub.position.x, sub.position.y + SUBSTATION.topY, sub.position.z);
+  const [sx, st] = px(topsideTop), [, sw] = px(sub.position.clone());
+  const wL = px(new THREE.Vector3(box.min.x, topsideTop.y, box.min.z)), wR = px(new THREE.Vector3(box.max.x, topsideTop.y, box.max.z));
+  return { turbines: rows, substation: { x: sx, topY: st, waterY: sw, target: { x: 723, topY: 207.8, waterY: 212 }, widthPx: round(Math.abs(wR[0] - wL[0])) } };
+}
+function scaleReport() {
+  return SCALE_REGISTRY.map((e) => {
+    const s = e.measure(), ax = e.expect?.axis ?? 'x';
+    const v = typeof s === 'number' ? s : (ax === 'max' ? Math.max(s.x, s.y, s.z) : s[ax]);
+    const ref = SCALE_TABLE[e.name] || e.expect;
+    return { name: e.name, measured: round(v, 3), expected: ref?.metres, tol: ref?.tolerance, ok: ref ? Math.abs(v - ref.metres) <= ref.tolerance : null };
+  });
+}
+function drawOverlay() {
+  const ov = document.getElementById('overlay');
+  ov.width = innerWidth; ov.height = innerHeight;
+  const g = ov.getContext('2d');
+  g.clearRect(0, 0, ov.width, ov.height);
+  if (VIEW !== 'drone' || !param('overlay', false)) return;
+  const sx = innerWidth / 760, sy = innerHeight / 506, pc = pixelChecks();
+  g.strokeStyle = 'rgba(255,0,255,0.95)'; g.lineWidth = 1;
+  for (const r of pc.turbines) { g.beginPath(); g.arc(r.target[0] * sx, r.target[1] * sy, 4, 0, 2 * Math.PI); g.stroke(); }
+  g.strokeStyle = 'rgba(0,255,255,0.95)';
+  g.beginPath(); g.arc(723 * sx, 210 * sy, 5, 0, 2 * Math.PI); g.stroke();
+}
+
+// ---------------------------------------------------------------- loop
+const hud = document.getElementById('hud');
+if (!param('hud', true)) hud.style.display = 'none';
+let benchHide = null;                 // name filter applied after each farm.update (benches, ?only=)
+const ONLY = param('only', '');
+if (ONLY) { const re = new RegExp(ONLY); benchHide = (n) => !re.test(n); }
+const timer = new THREE.Timer(); timer.connect(document);
+let frames = 0, fpsT = performance.now(), fps = 0, updMs = 0;
+function step(realDt) {
+  const dt = FROZEN ? 0 : realDt;
+  if (!FROZEN) { U.uTime.value += dt; ctx.clock.update(dt); }
+  const t = U.uTime.value;
+  renderer.info.reset();
+  U.uCameraPos.value.copy(camera.position);
+  ctx.atmosphere.update(dt, t, camera);
+  const a = performance.now();
+  farm.update(dt, t, camera);
+  updMs += (performance.now() - a - updMs) * 0.1;
+  if (benchHide) for (const o of farm.root.children) if (benchHide(o.name)) o.visible = false;
+  ctx.ocean?.update(dt, t, camera);
+  ctx.post.render(realDt, { snap: FROZEN });
+}
+step(0);
+renderer.setRenderTarget(ctx.post.sceneTarget);
+await renderer.compileAsync(scene, camera);
+renderer.setRenderTarget(null);
+drawOverlay();
+
+const report = {
+  buildMs: round(buildMs, 0),
+  classes: farm.classCounts,
+  lamps: { total: farm.lights.count, ...farm.lights.counts },
+  lattice: { a: round(farm.lattice.a, 3), b: round(farm.lattice.b, 3) },
+  idle: farm.turbines.filter((t) => t.idle).map((t) => t.id),
+  piles: farm.pilePositions().length,
+  substationPiles: farm.pilePositions().slice(farm.turbines.length * 3).map((p) => [round(p.x), round(p.z), round(p.radius, 2)]),
+  pixels: pixelChecks(),
+};
+window.__farmReport = report;
+console.log('FARM ' + JSON.stringify({ buildMs: report.buildMs, classes: report.classes, lamps: report.lamps, lattice: report.lattice, idle: report.idle, piles: report.piles }));
+console.log('SUBPILES ' + JSON.stringify(report.substationPiles));
+console.log('PIXELS ' + JSON.stringify(report.pixels));
+console.log('SCALE ' + JSON.stringify(scaleReport().filter((r) => r.name.startsWith('lattice') || !r.ok)));
+
+function frame(ts) {
+  timer.update(ts);
+  step(Math.min(0.1, timer.getDelta()));
+  frames++;
+  const now = performance.now();
+  if (now - fpsT > 500) { fps = frames * 1000 / (now - fpsT); frames = 0; fpsT = now; }
+  const info = renderer.info.render, s = farm.stats;
+  window.__sceneStats = { fps: round(fps), frameMs: round(1000 / Math.max(fps, 1e-3), 2), drawCalls: info.calls, triangles: info.triangles, programs: renderer.info.programs.length, farmUpdateMs: round(updMs, 3), lod: s.lod, culled: s.culled, casters: s.casters, lamps: farm.lights.mesh.visible, sunEl: round(ctx.atmosphere.sunElevationDeg, 2), exposure: ctx.post.exposure };
+  hud.textContent = `view ${VIEW}  ${fps.toFixed(0)} fps  calls ${info.calls}  tris ${(info.triangles / 1000).toFixed(0)}k  farm.update ${updMs.toFixed(2)} ms\n` +
+    `LOD ${s.lod.join('/')}  culled ${s.culled}  casters ${s.casters}  sun ${ctx.atmosphere.sunElevationDeg.toFixed(1)}°  lights ${farm.lights.aviationOn ? 'AV' : '--'} ${farm.lights.marineOn ? 'MAR' : '---'}`;
+}
+// ---------------------------------------------------------------- benches
+// Other agents share the GPU: compare configurations within one run, never trust absolutes.
+//   ?bench=wall  wall-clock ms per frame (rAF-driven; GPU-bound at these loads) per configuration,
+//                interleaved rounds, median. Counts every pass: shadow maps, the ocean's mirror,
+//                the view, post. The primary cost measurement.
+//   ?bench=gpu   GPU timer queries around the post scene pass (shadow maps + the view) and the
+//                ocean's mirror pass. On ANGLE/Metal a query spans whole command buffers, so the
+//                two can include each other's work; use it to locate a cost, not to size it.
+const BENCH = String(param('bench', ''));
+const nextFrame = () => new Promise((r) => requestAnimationFrame(r));
+const median = (a) => { const s = [...a].sort((x, y) => x - y); return round(s[Math.floor(s.length / 2)], 2); };
+const onlyGroup = (re) => (n) => !re.test(n);
+const BENCH_CONFIGS = {
+  noFarm: () => { benchHide = () => true; },
+  all: () => { benchHide = null; },
+  lod0: () => { benchHide = onlyGroup(/^farm\.lod0\./); },
+  lod1: () => { benchHide = onlyGroup(/^farm\.lod1\./); },
+  lod2: () => { benchHide = onlyGroup(/^farm\.lod2\./); },
+  lamps: () => { benchHide = onlyGroup(/^farm\.lamps$/); },
+  substation: () => { benchHide = onlyGroup(/^substation$/); },
+};
+if (BENCH === 'wall') {
+  // Also: the whole farm kept out of the ocean's mirror (its own cost without the mirror's).
+  const reflectFlags = new Map(farm.root.children.map((o) => [o, o.layers.isEnabled(1)]));
+  const setMirror = (on) => { for (const [o, had] of reflectFlags) { if (on && had) o.layers.enable(1); else o.layers.disable(1); } };
+  const configs = { ...BENCH_CONFIGS, allNotInMirror: () => { benchHide = null; setMirror(false); } };
+  const res = {};
+  for (let r = 0; r < 5; r++) for (const [name, apply] of Object.entries(configs)) {
+    setMirror(true); apply();
+    for (let i = 0; i < 10; i++) { step(1 / 60); await nextFrame(); }
+    const a = performance.now();
+    for (let i = 0; i < 60; i++) { step(1 / 60); await nextFrame(); }
+    (res[name] ||= []).push((performance.now() - a) / 60);
+  }
+  setMirror(true); benchHide = null;
+  const ms = Object.fromEntries(Object.entries(res).map(([k, v]) => [k, median(v)]));
+  const cost = Object.fromEntries(Object.entries(ms).filter(([k]) => k !== 'noFarm').map(([k, v]) => [k, round(v - ms.noFarm, 2)]));
+  console.log('WALL ' + JSON.stringify({ view: VIEW, time: ctx.clock.hours, lod: farm.stats.lod, msPerFrame: ms, farmCost: cost }));
+}
+if (BENCH === 'gpu') {
+  const gl = renderer.getContext(), ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+  if (!ext) console.log('GPUBENCH unavailable');
+  else {
+    const samples = {}, pending = [];
+    let config = 'all';
+    const wrap = (obj, label) => {
+      const orig = obj.render.bind(obj);
+      obj.render = (...args) => {
+        const q = gl.createQuery();
+        gl.beginQuery(ext.TIME_ELAPSED_EXT, q); orig(...args); gl.endQuery(ext.TIME_ELAPSED_EXT);
+        pending.push({ key: `${config}.${label}`, q });
+      };
+      return () => { obj.render = orig; };
+    };
+    const unwrap = [wrap(ctx.post.scenePass, 'scene'), ...(ctx.ocean ? [wrap(ctx.ocean.reflection, 'mirror')] : [])];
+    const poll = () => {
+      for (let i = pending.length - 1; i >= 0; i--) {
+        const p = pending[i];
+        if (!gl.getQueryParameter(p.q, gl.QUERY_RESULT_AVAILABLE)) continue;
+        if (!gl.getParameter(ext.GPU_DISJOINT_EXT)) (samples[p.key] ||= []).push(gl.getQueryParameter(p.q, gl.QUERY_RESULT) / 1e6);
+        gl.deleteQuery(p.q); pending.splice(i, 1);
+      }
+    };
+    for (let r = 0; r < 4; r++) for (const [name, apply] of Object.entries(BENCH_CONFIGS)) {
+      config = name; apply();
+      for (let i = 0; i < 24; i++) { step(1 / 60); await nextFrame(); poll(); }
+    }
+    benchHide = null;
+    for (let i = 0; i < 30 && pending.length; i++) { await nextFrame(); poll(); }
+    unwrap.forEach((f) => f());
+    const out = Object.fromEntries(Object.keys(BENCH_CONFIGS).map((n) => [n, { scene: median(samples[`${n}.scene`] || [NaN]), mirror: median(samples[`${n}.mirror`] || [NaN]) }]));
+    console.log('GPUBENCH ' + JSON.stringify({ view: VIEW, lod: farm.stats.lod, medians: out }));
+  }
+}
+renderer.setAnimationLoop(frame);
+let ready = 0;
+const readyCheck = () => { if (++ready >= 3) window.__sceneReady = true; else requestAnimationFrame(readyCheck); };
+requestAnimationFrame(readyCheck);
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight); ctx.post.setSize(innerWidth, innerHeight, renderer.getPixelRatio()); drawOverlay();
+});
+</script>
+</body>
+</html>

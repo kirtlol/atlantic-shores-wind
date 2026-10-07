@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shell dev page (stubs)</title>
+<!-- Shell dev page: the real main.js with any scene module swapped for the shell's stubs in
+     dev/stubs/shell-*.js. ?stubs=1 (default) stubs every module; ?stubs=ocean,farm only those. -->
+<link rel="stylesheet" href="../src/ui/ui.css">
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<div class="stage" id="stage">
+<canvas id="scene" tabindex="0" aria-label="Shell dev view"></canvas>
+<div id="loading" role="status" aria-live="polite">
+  <div class="loading-box">
+    <p id="loading-status">Loading the scene</p>
+    <div class="loading-track"><div id="loading-bar"></div></div>
+    <button type="button" class="btn" id="loading-action" hidden>Reload the scene</button>
+  </div>
+</div>
+</div>
+<script type="module" src="./shell-stubs.js"></script>
+</body>
+</html>

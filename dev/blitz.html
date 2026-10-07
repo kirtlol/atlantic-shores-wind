@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Wildlife dev: blitz + birds</title>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"}}
+</script>
+<style>html, body { margin: 0; height: 100%; overflow: hidden; background: #000; } canvas { display: block; width: 100%; height: 100%; }</style>
+</head>
+<body>
+<script type="module">
+// Wildlife dev page (blitz.js + birds.js) on the real ocean, atmosphere and post chain, with a stub
+// farm (yellow TP "pile" + platform and railings at the real positions near the hero) or ?farm=real.
+// URL parameters:
+//   view=close|near|blitz|side|high|lineup|deck   close: 12 m up, 30 m from the strike point; blitz: the Blitz preset
+//                                       re-aimed at the strike point (as main.js does); side: 3 m up, 18 m
+//                                       away (profile of the crown); near: 3.5 m up, 11 m away (structure);
+//                                       high: 60 m up over the flock; deck: the CTV deck view of the hero TP
+//   mode=strike|live|rising             strike: one forced strike (quiet school), then hold `after` s later;
+//                                       live: blitz.trigger() at the point and `warm` s of simulation first;
+//                                       rising: the same, starting at the nervous-water stage
+//   species=bass|bluefish|albie|tuna   h=1.0 (crown m)   show=none|roll|jump|skyrocket|crash   bait=menhaden|sandEel|anchovy
+//   after=0.5 (s after the strike to hold)   warm=0 (s simulated before the strike)   hold=1 (freeze there)
+//   time=16.5  date=06-21  quality=high  farm=stub|real  ruler=1  birds=1  wind=4.5  seed=1
+//   perf=1 (cost of the life modules)   scales=1 (registerScale report in the console)
+import * as THREE from 'three';
+import { U, param, SCALE_REGISTRY, azimuthToDir, curvatureDrop, LAYER_REFLECT } from '../src/shared.js';
+import { CAMERA_PRESETS, QUALITY, RENDER, SEA, SCALE_TABLE, LIFE } from '../src/config.js';
+const fog = await import('../src/env/fog.js');                  // patches ShaderChunk before anything compiles
+const [{ Atmosphere }, { SimClock }, { Ocean }, { Post }] = await Promise.all([
+  import('../src/env/atmosphere.js'), import('../src/env/time.js'), import('../src/ocean/ocean.js'), import('../src/post/post.js')]);
+const { Blitz, FishInstances, FISH_SPECIES } = await import('../src/life/blitz.js');
+const { Birds, BirdMesh, BIRD_SPECIES } = await import('../src/life/birds.js');
+const { buildStubFarm } = await import('./stubs/wildlife-farm.js');
+
+const DEG = Math.PI / 180;
+const SPECIES = { bass: 'stripedBass', bluefish: 'bluefish', albie: 'falseAlbacore', tuna: 'bluefinTuna' };
+const viewName = param('view', 'close');
+const mode = param('mode', 'strike');
+const species = SPECIES[param('species', 'bass')] ?? 'stripedBass';
+const quality = QUALITY[param('quality', 'high')] || QUALITY.high;
+const after = param('after', 0.5);
+const warm = param('warm', mode === 'live' ? 40 : mode === 'rising' ? 4 : 0);
+const hold = param('hold', true);
+const t0 = param('t', 100);
+// The strike point: the sea point the Blitz preset frames (main.js ?blitz=1), 103 m from the hero.
+const P = CAMERA_PRESETS.blitz;
+const fwd = (h, p) => new THREE.Vector3(Math.sin(h * DEG) * Math.cos(p * DEG), Math.sin(p * DEG), -Math.cos(h * DEG) * Math.cos(p * DEG));
+const B = new THREE.Vector3().fromArray(P.position).addScaledVector(fwd(P.headingDeg, P.pitchDeg), 120.2).setY(0);
+
+// ---------------------------------------------------------------- renderer, scene, camera
+const renderer = new THREE.WebGLRenderer({ antialias: false, logarithmicDepthBuffer: RENDER.logarithmicDepthBuffer, powerPreference: 'high-performance' });
+renderer.setPixelRatio(1);
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0xffffff, RENDER.far, 2 * RENDER.far);
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, RENDER.near, RENDER.far);
+camera.rotation.order = 'YXZ';
+scene.add(camera);
+
+const [dm, dd] = String(param('date', '06-21')).split('-').map(Number);
+const ctx = { renderer, scene, camera, quality, seed: param('seed', 1) };
+ctx.clock = new SimClock({ month: dm, day: dd, hours: param('time', 16.5), speed: 1 });
+ctx.atmosphere = new Atmosphere(ctx);
+ctx.ocean = new Ocean(ctx);
+ctx.ocean.setSeaState({ windSpeed: param('wind', SEA.windSpeed) }, { immediate: true });
+if (param('farm', 'stub') === 'real') {
+  const { Farm } = await import('../src/farm/farm.js');
+  ctx.farm = new Farm(ctx);
+} else ctx.farm = buildStubFarm(ctx, fog.applyAtmosphere);
+if (param('birds', true)) ctx.birds = new Birds(ctx);
+ctx.blitz = new Blitz(ctx);
+const post = new Post(ctx);
+
+// ---------------------------------------------------------------- camera for the view
+function aim(pos, target, fov) {
+  camera.position.copy(pos);
+  camera.fov = fov;
+  const d = new THREE.Vector3().subVectors(target, pos);
+  camera.rotation.set(Math.atan2(d.y, Math.hypot(d.x, d.z)), Math.atan2(-d.x, -d.z), 0);
+  camera.updateProjectionMatrix();
+  camera.updateMatrixWorld();
+}
+const VIEW_HEADING = param('heading', 20);           // looking NNE: the 16:30 sun (266.6°) comes from the left
+function setView(C = B) {
+  const dir = azimuthToDir(VIEW_HEADING);
+  const at = new THREE.Vector3(C.x, 0.7, C.z);
+  if (viewName === 'blitz') {
+    const pos = new THREE.Vector3().fromArray(P.position).add(new THREE.Vector3(C.x, 0, C.z)).sub(
+      new THREE.Vector3().fromArray(P.position).addScaledVector(fwd(P.headingDeg, P.pitchDeg), 120.2).setY(0));
+    pos.y = P.position[1];
+    camera.position.copy(pos);
+    camera.rotation.set(P.pitchDeg * DEG, -P.headingDeg * DEG, 0);
+    camera.fov = P.vfovDeg; camera.updateProjectionMatrix(); camera.updateMatrixWorld();
+  } else if (viewName === 'side') aim(at.clone().addScaledVector(dir, -18).setY(3), new THREE.Vector3(C.x, 1.0, C.z), 45);
+  else if (viewName === 'high') aim(at.clone().addScaledVector(dir, -70).setY(60), new THREE.Vector3(C.x, 8, C.z), 50);
+  else if (viewName === 'lineup') aim(new THREE.Vector3(C.x, 6.2, C.z).addScaledVector(dir, -10.5), new THREE.Vector3(C.x, 1.9, C.z), 45);
+  else if (viewName === 'near') aim(at.clone().addScaledVector(dir, -11).setY(3.5), new THREE.Vector3(C.x, 0.8, C.z), 45);
+  else if (viewName === 'poses') aim(new THREE.Vector3(C.x, param('camy', 4.2), C.z).addScaledVector(dir, -9), new THREE.Vector3(C.x, 3.3, C.z).addScaledVector(dir, 2.4), 45);
+  else if (viewName === 'rail') { const d = azimuthToDir(param('railaz', 250)); aim(new THREE.Vector3(d.x * 25, 22.5, d.z * 25), new THREE.Vector3(0, 19.2, 0), 32); }
+  else if (viewName === 'deck') aim(new THREE.Vector3(5.5, 4, -15), new THREE.Vector3(0, 21, 0), 60);
+  else aim(at.clone().addScaledVector(dir, -30).setY(12), at, 45);
+}
+setView();
+
+// ---------------------------------------------------------------- dev-only references (never in shipped code)
+const refs = new THREE.Group();
+refs.name = 'dev.refs';
+scene.add(refs);
+function label(text, h = 0.28) {
+  const c = document.createElement('canvas'); c.width = 256; c.height = 64;
+  const g = c.getContext('2d'); g.fillStyle = 'rgba(0,0,0,0.55)'; g.fillRect(0, 0, 256, 64);
+  g.fillStyle = '#fff'; g.font = 'bold 34px sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 128, 34);
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, color: new THREE.Color(1, 1, 1).multiplyScalar(0.6) }));
+  s.scale.set(h * 4, h, 1); s.renderOrder = 10;
+  return s;
+}
+const refMat = (c) => fog.applyAtmosphere(new THREE.MeshStandardMaterial({ color: c, roughness: 0.7 }));
+// A 1.80 m figure (legs 0.85 m, torso, head) and a 4 m survey rod banded every 0.5 m.
+function figure() {
+  const g = new THREE.Group(), m = refMat(0x2a3a55), skin = refMat(0xc8987a);
+  const leg = new THREE.CylinderGeometry(0.075, 0.065, 0.85, 10);
+  for (const x of [-0.1, 0.1]) { const l = new THREE.Mesh(leg, m); l.position.set(x, 0.425, 0); g.add(l); }
+  const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.19, 0.16, 0.62, 12), m); torso.position.y = 0.85 + 0.31; g.add(torso);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.115, 16, 12), skin); head.position.y = 1.80 - 0.115; g.add(head);
+  for (const x of [-0.24, 0.24]) { const a = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.045, 0.62, 8), m); a.position.set(x, 1.15, 0); g.add(a); }
+  const lb = label('1.80 m'); lb.position.y = 2.1; g.add(lb);
+  return g;
+}
+function rod(height = 4) {
+  const g = new THREE.Group(), red = refMat(0xb02020), white = refMat(0xeeeeee);
+  for (let k = 0; k < height / 0.5; k++) {
+    const seg = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.5, 0.06), k % 2 ? white : red);
+    seg.position.y = 0.25 + 0.5 * k; g.add(seg);
+  }
+  for (let k = 1; k <= height; k++) { const lb = label(`${k} m`, 0.2); lb.position.set(0.45, k, 0); g.add(lb); }
+  return g;
+}
+const floaters = [];              // [{ obj, x, z }] kept on the sea surface
+if (param('ruler', true) && viewName !== 'lineup') {
+  const right = azimuthToDir(VIEW_HEADING + 90);
+  const f = figure(); refs.add(f); floaters.push({ obj: f, x: B.x + right.x * 2.6, z: B.z + right.z * 2.6 });
+  const r = rod(species === 'bluefinTuna' ? 5 : 3); refs.add(r); floaters.push({ obj: r, x: B.x - right.x * 2.4, z: B.z - right.z * 2.4 });
+}
+function placeFloaters(t) {
+  for (const f of floaters) { f.obj.position.set(f.x, ctx.ocean.getHeight(f.x, f.z, t), f.z); f.obj.rotation.y = -VIEW_HEADING * DEG; }
+}
+
+// Scale line-up: every bird species spread (from above-behind) over a bar of its config wingspan,
+// every fish species side-on over a bar of its config length, plus the 1.80 m figure.
+if (viewName === 'lineup') {
+  const right = azimuthToDir(VIEW_HEADING + 90), ahead = azimuthToDir(VIEW_HEADING);
+  const base = new THREE.Vector3(B.x, 0, B.z);
+  const bar = (len, pos, dirV, col = 0xff4020) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(len, 0.03, 0.03), refMat(col));
+    m.position.copy(pos); m.rotation.y = Math.atan2(-dirV.z, dirV.x); refs.add(m);
+  };
+  const keys = Object.keys(BIRD_SPECIES);
+  keys.forEach((key, i) => {
+    const bm = new BirdMesh(key, 1, refs);
+    const off = (i - (keys.length - 1) / 2) * 2.3;
+    const p = base.clone().addScaledVector(right, off).addScaledVector(ahead, 1.5).setY(3.2);
+    const agent = { pos: p, quat: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.atan2(ahead.x, ahead.z), 0, 'YXZ')), arm: 0, hand: 0, fold: 0, legs: 0 };
+    bm.add(agent, new THREE.Color(1, 1, 1)); bm.commit();
+    bar(LIFE.birds[key].wingspan, p.clone().setY(2.95), right, 0xff4020);
+    const lb = label(`${key} ${LIFE.birds[key].wingspan} m`, 0.22); lb.position.copy(p).setY(3.75); refs.add(lb);
+  });
+  const fkeys = Object.keys(FISH_SPECIES);
+  fkeys.forEach((key, i) => {
+    const fi = new FishInstances(key, 1, refs);
+    const off = (i - (fkeys.length - 1) / 2) * 1.35;
+    const p = base.clone().addScaledVector(right, off).addScaledVector(ahead, -1.5).setY(1.2);
+    // posed in the surface-roll mode at (almost) zero speed and amplitude: level, along `right`
+    fi.launch([p.x, p.y, p.z, U.uTime.value], [right.x * 1e-3, 0, right.z * 1e-3, 1e9], [1, 1, 0, 0.3], [0, 0, 0, 0]);
+    fi.flush(U.uTime.value, true);
+    const L = FISH_SPECIES[key].length;
+    bar(L, p.clone().setY(0.95), right, 0x20a0ff);
+    const lb = label(`${key} ${L} m`, 0.12); lb.position.copy(p).setY(1.5); refs.add(lb);
+  });
+  const f = figure(); refs.add(f); floaters.push({ obj: f, x: base.x + right.x * 6.2 - ahead.x * 0.5, z: base.z + right.z * 6.2 - ahead.z * 0.5 });
+}
+
+// Wing-pose board: each species (rows) in glide, top of the downstroke, bottom of the downstroke,
+// mid-upstroke, the plunge dart and standing (columns), three-quarter front view at ~9 m.
+if (viewName === 'poses') {
+  const right = azimuthToDir(VIEW_HEADING + 90), ahead = azimuthToDir(VIEW_HEADING);
+  const keys = Object.keys(BIRD_SPECIES);
+  const yaw = Math.atan2(-ahead.x, -ahead.z) + 0.9;             // facing the camera, turned 50° to its left
+  keys.forEach((key, r) => {
+    const A = BIRD_SPECIES[key].amp;
+    const poses = [
+      [0.14, -0.26, 0.04, 0], [0.08 + A[0], -0.05 + A[1] * Math.sin(Math.PI / 2 - A[2]), 0.05, 0],
+      [0.08 - A[0], -0.05 + A[1] * Math.sin(-Math.PI / 2 - A[2]), 0.05, 0], [0.08, -0.05 + A[1] * Math.sin(-A[2]), 0.29, 0],
+      [0.05, 0, 1, 0], [0.06, 0, 1, 1]];
+    const bm = new BirdMesh(key, poses.length, refs);
+    poses.forEach(([arm, hand, fold, legs], c) => {
+      const p = new THREE.Vector3(B.x, 0, B.z).addScaledVector(right, (c - 2.5) * 2.1).addScaledVector(ahead, r * 1.6).setY(1.2 + r * 1.5);
+      bm.add({ pos: p, quat: new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0, 'YXZ')), arm, hand, fold, legs }, new THREE.Color(1, 1, 1));
+    });
+    bm.commit();
+    // reference card in this species' mantle colour, level, beside the row (dev check of the plumage values)
+    const card = new THREE.Mesh(new THREE.PlaneGeometry(0.8, 0.5).rotateX(-Math.PI / 2), refMat(new THREE.Color(BIRD_SPECIES[key].colours.mantle)));
+    card.position.copy(new THREE.Vector3(B.x, 0, B.z).addScaledVector(right, 3.5 * 2.1).addScaledVector(ahead, r * 1.6).setY(1.2 + r * 1.5));
+    refs.add(card);
+  });
+}
+
+// ---------------------------------------------------------------- simulation
+let holding = false;
+const log = { strikes: [] };
+function step(dt, { render = true, oceanStep = true } = {}) {
+  if (holding) dt = 0;
+  U.uTime.value += dt;
+  const t = U.uTime.value;
+  ctx.clock.update(dt);
+  ctx.atmosphere.update(dt, t, camera);
+  ctx.farm.update?.(dt, t, camera);
+  ctx.birds?.update(dt, t, camera);
+  ctx.blitz.update(dt, t, camera);
+  placeFloaters(t);
+  for (const h of String(param('hide', '')).split(',')) {          // diagnostics: hide=spray,fish,birds,refs
+    if (h === 'spray') ctx.blitz.spray.mesh.visible = false;
+    if (h === 'fish') for (const f of Object.values(ctx.blitz.fish)) f.mesh.visible = false;
+    if (h === 'birds' && ctx.birds) ctx.birds.root.visible = false;
+    if (h === 'refs') refs.visible = false;
+  }
+  if (oceanStep) ctx.ocean.update(dt, t, camera);
+  if (render) post.render(dt);
+}
+const strikeOpts = { species, height: param('h', species === 'bluefinTuna' ? 3 : 1.0), show: param('show', 'none'), bait: param('bait', undefined) };
+U.uTime.value = t0 - warm - (mode === 'strike' ? 0 : 0);
+step(0, { render: false });
+if (mode === 'live' || mode === 'rising') ctx.blitz.trigger(B.x, B.z, { ...(param('species', null) ? { species, bait: param('bait', undefined) } : {}), rising: mode === 'rising' });
+// warm-up: blitz and birds every frame, the ocean only for the last 2 s (its state is analytic in time)
+const warmFrames = Math.round(warm * 60);
+for (let i = 0; i < warmFrames; i++) {
+  step(1 / 60, { render: false, oceanStep: i > warmFrames - 120 });
+  // the camera follows the school (as main.js does for the Blitz view)
+  const f = mode === 'live' || mode === 'rising' ? ctx.blitz.focus() : null;
+  if (f && i % 30 === 0) setView(f);
+}
+if (mode === 'strike' && viewName !== 'lineup') { ctx.blitz.strikeAt(B.x, B.z, strikeOpts); log.strikes.push({ t: U.uTime.value, ...strikeOpts }); }
+for (let k = 0; k < param('stress', 0); k++) {                     // worst case: N strikes at once within 15 m
+  const a = k * 2.39996, r = 15 * Math.sqrt((k + 0.5) / param('stress', 0));
+  ctx.blitz.strikeAt(B.x + Math.cos(a) * r, B.z + Math.sin(a) * r, strikeOpts);
+}
+const afterFrames = Math.round(after * 60);
+for (let i = 0; i < afterFrames; i++) step(1 / 60, { render: false, oceanStep: i > afterFrames - 120 });
+holding = hold;
+await renderer.compileAsync(scene, camera, scene);
+
+let frames = 0;
+function frame() {
+  step(1 / 60);
+  frames++;
+  if (frames === 4) onReady();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------------------------------------------------------------- measurements
+function lifePerf() {
+  // GPU: drawing only the life meshes into the composer format at this instant; then CPU: blitz +
+  // birds updates over 2 s of live simulation
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  const rt = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: quality.msaa });
+  const only = new THREE.Scene(); only.fog = scene.fog; only.environment = scene.environment;
+  const roots = [ctx.blitz.root, ctx.birds?.root].filter(Boolean);
+  const parents = roots.map((r) => r.parent);
+  const lights = [ctx.atmosphere.sunLight, ctx.atmosphere.moonLight];
+  roots.forEach((r) => only.add(r));
+  const px = new Uint16Array(4);
+  const empty = new THREE.Scene(); empty.fog = scene.fog;
+  renderer.setRenderTarget(rt); renderer.render(only, camera); renderer.readRenderTargetPixels(rt, 0, 0, 1, 1, px);
+  // interleaved batches (life, empty baseline) so other GPU users slow both alike; min of each
+  let best = Infinity, base = Infinity, calls = 0, tris = 0;
+  for (let b = 0; b < 8; b++) {
+    for (const [sc, isLife] of [[only, true], [empty, false]]) {
+      renderer.readRenderTargetPixels(rt, 0, 0, 1, 1, px);
+      const a = performance.now();
+      for (let i = 0; i < 10; i++) renderer.render(sc, camera);
+      renderer.readRenderTargetPixels(rt, 0, 0, 1, 1, px);
+      const ms = (performance.now() - a) / 10;
+      if (isLife) { best = Math.min(best, ms); calls = renderer.info.render.calls; tris = renderer.info.render.triangles; } else base = Math.min(base, ms);
+    }
+  }
+  renderer.setRenderTarget(null);
+  roots.forEach((r, i) => parents[i].add(r));
+  best = best - base;
+  const sprayLive = (() => { const a = ctx.blitz.spray.buf.attrs[0].array, l = ctx.blitz.spray.buf.attrs[3].array; let k = 0; for (let i = 0; i < ctx.blitz.spray.capacity; i++) { const age = U.uTime.value - a[i * 4 + 3]; if (age >= 0 && age <= l[i * 4]) k++; } return k; })();
+  const wasHolding = holding; holding = false;
+  let cpu = 0; const n = 120;
+  for (let i = 0; i < n; i++) {
+    U.uTime.value += 1 / 60; const t = U.uTime.value;
+    const a = performance.now(); ctx.birds?.update(1 / 60, t, camera); ctx.blitz.update(1 / 60, t, camera); cpu += performance.now() - a;
+  }
+  holding = wasHolding;
+  rt.dispose();
+  return { cpuMsPerFrame: +(cpu / n).toFixed(3), gpuMsLifeOnly: +best.toFixed(2), gpuMsEmptyBaseline: +base.toFixed(2), drawCallsLife: calls, trianglesLife: tris, birds: ctx.birds?.count ?? 0, blitzes: ctx.blitz.active.length, sprayLive };
+}
+function onReady() {
+  const report = { view: viewName, mode, species, after, warm, t: +U.uTime.value.toFixed(3), sunEl: +ctx.atmosphere.sunElevationDeg.toFixed(1) };
+  report.blitzes = ctx.blitz.active.map((b) => ({ id: b.id, species: b.species, bait: b.bait, state: b.state, x: +b.x.toFixed(1), z: +b.z.toFixed(1), r: +b.radius.toFixed(1), intensity: +b.intensity.toFixed(2) }));
+  if (ctx.birds) {
+    const by = {};
+    for (const a of ctx.birds.agents) { const k = `${a.key}:${a.state}`; by[k] = (by[k] ?? 0) + 1; }
+    report.birds = by;
+  }
+  if (param('scales', false)) {
+    report.scales = SCALE_REGISTRY.filter((e) => /^(fish|bird|blitz)\./.test(e.name)).map((e) => {
+      const ax = e.expect?.axis ?? 'max';
+      let m;
+      if (e.measure) { const v = e.measure(); m = typeof v === 'number' ? v : v[ax]; }
+      else { e.geometry.computeBoundingBox(); const s = e.geometry.boundingBox.getSize(new THREE.Vector3()); m = ax === 'max' ? Math.max(s.x, s.y, s.z) : s[ax]; }
+      const ref = SCALE_TABLE[e.name];
+      const exp = ref ? ref.metres : e.expect?.metres, tol = ref ? ref.tolerance : e.expect?.tolerance;
+      return { name: e.name, measured: +m.toFixed(3), expected: exp, tol, ok: Math.abs(m - exp) <= tol + 1e-9 };
+    });
+  }
+  if (param('perf', false)) report.perf = lifePerf();
+  report.render = { calls: renderer.info.render.calls, programs: renderer.info.programs.length };
+  console.log('WILDLIFE_REPORT ' + JSON.stringify(report));
+  window.__wildlifeReport = report;
+  window.__sceneReady = true;
+}
+window.__life = { ctx, B, step, strike: (o = {}) => ctx.blitz.strikeAt(B.x, B.z, { ...strikeOpts, ...o }), release() { holding = false; }, freeze() { holding = true; } };
+</script>
+</body>
+</html>

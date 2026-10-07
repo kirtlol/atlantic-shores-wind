@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Offshore wind off Atlantic City (planned)</title>
+<meta name="description" content="A fully procedural, to-scale 3D model of the planned Atlantic Shores South offshore wind farm, 17 km off Atlantic City, with a day and night cycle.">
+<link rel="stylesheet" href="./src/ui/ui.css">
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<div class="stage" id="stage">
+<canvas id="scene" tabindex="0" aria-label="3D view of the planned Atlantic Shores South wind farm. Drag to orbit, scroll or pinch to zoom; arrow keys pan."></canvas>
+
+<div id="loading" role="status" aria-live="polite">
+  <div class="loading-box">
+    <p id="loading-status">Loading the scene</p>
+    <div class="loading-track"><div id="loading-bar"></div></div>
+    <button type="button" class="btn" id="loading-action" hidden>Reload the scene</button>
+  </div>
+</div>
+
+<aside id="panel" aria-label="Scene controls" data-collapsed="false" hidden>
+  <div class="panel-head">
+    <div class="clock" aria-live="off">
+      <div class="clock-time"><span id="clock-hm">17:15</span><span id="clock-tz">EDT</span></div>
+      <div id="clock-sub">21 Jun 2026 · sun +34.4°</div>
+    </div>
+    <button id="btn-play" class="icon-btn" type="button" aria-pressed="false" aria-label="Play time" title="Play or pause time (Space)">
+      <svg id="icon-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9.5-5.5z"/></svg>
+      <svg id="icon-pause" viewBox="0 0 16 16" aria-hidden="true" hidden><path d="M3.5 2.5h3.2v11H3.5zM9.3 2.5h3.2v11H9.3z"/></svg>
+    </button>
+    <button id="btn-collapse" class="icon-btn" type="button" aria-expanded="true" aria-controls="panel-body" aria-label="Hide controls" title="Hide or show controls">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.2 10.4 8 5.6l4.8 4.8-1.1 1.1L8 7.8l-3.7 3.7z"/></svg>
+    </button>
+  </div>
+
+  <div id="panel-body" class="panel-body">
+    <section class="group" aria-labelledby="lbl-time">
+      <div class="group-head"><h2 id="lbl-time">Time of day</h2><output id="out-time" for="in-time" class="num">17:15</output></div>
+      <input id="in-time" type="range" min="0" max="1435" step="5" value="1035" aria-labelledby="lbl-time" aria-describedby="sun-times" aria-valuetext="17:15 EDT">
+      <div class="scale" aria-hidden="true"><span>00</span><span>06</span><span>12</span><span>18</span><span>24</span></div>
+      <p id="sun-times" class="hint num">Sunrise 05:31 · sunset 20:26</p>
+      <div class="row">
+        <fieldset class="seg" id="speed-group">
+          <legend>Speed</legend>
+          <div class="seg-items">
+            <input type="radio" name="speed" id="speed-1" value="1"><label for="speed-1">1×</label>
+            <input type="radio" name="speed" id="speed-60" value="60" checked><label for="speed-60">60×</label>
+            <input type="radio" name="speed" id="speed-600" value="600"><label for="speed-600">600×</label>
+            <input type="radio" name="speed" id="speed-3600" value="3600"><label for="speed-3600">3600×</label>
+          </div>
+        </fieldset>
+        <div class="field">
+          <label class="field-label" for="in-month">Month</label>
+          <span class="select-wrap">
+            <select id="in-month">
+              <option value="1">Jan</option><option value="2">Feb</option><option value="3">Mar</option>
+              <option value="4">Apr</option><option value="5">May</option><option value="6" selected>Jun</option>
+              <option value="7">Jul</option><option value="8">Aug</option><option value="9">Sep</option>
+              <option value="10">Oct</option><option value="11">Nov</option><option value="12">Dec</option>
+            </select>
+          </span>
+        </div>
+      </div>
+    </section>
+
+    <section class="group weather" aria-label="Weather">
+      <div class="field">
+        <div class="group-head"><label class="field-label" for="in-wind">Wind at 10 m</label><output id="out-wind" for="in-wind" class="num">4.5 m/s</output></div>
+        <input id="in-wind" type="range" min="0" max="25" step="0.5" value="4.5" aria-describedby="wind-hint">
+        <p id="wind-hint" class="hint num">Beaufort 3 · rotor 5.0 rpm</p>
+      </div>
+      <div class="field">
+        <div class="group-head"><label class="field-label" for="in-clouds">Cloud cover</label><output id="out-clouds" for="in-clouds" class="num">28 %</output></div>
+        <input id="in-clouds" type="range" min="0" max="1" step="0.01" value="0.28">
+      </div>
+    </section>
+
+    <section class="group" aria-labelledby="lbl-view">
+      <h2 id="lbl-view">View</h2>
+      <div class="views">
+        <button type="button" class="view" id="view-drone" data-view="drone" aria-pressed="true"><span>Drone reference</span><kbd>1</kbd></button>
+        <button type="button" class="view" id="view-deck" data-view="deck" aria-pressed="false"><span>CTV deck</span><kbd>2</kbd></button>
+        <button type="button" class="view" id="view-nacelle" data-view="nacelle" aria-pressed="false"><span>Nacelle roof</span><kbd>3</kbd></button>
+        <button type="button" class="view" id="view-blitz" data-view="blitz" aria-pressed="false"><span>Blitz</span><kbd>4</kbd></button>
+        <button type="button" class="view" id="view-overview" data-view="overview" aria-pressed="false"><span>Farm overview</span><kbd>5</kbd></button>
+        <button type="button" class="view" id="view-cinematic" data-view="cinematic" aria-pressed="false"><span>Cinematic</span><kbd>6</kbd></button>
+      </div>
+    </section>
+
+    <section class="group" aria-labelledby="lbl-show">
+      <h2 id="lbl-show">Show</h2>
+      <div class="switches">
+        <label class="switch" for="tg-blitz"><input type="checkbox" id="tg-blitz" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span class="switch-name">Fish blitzes</span></span></label>
+        <label class="switch" for="tg-birds"><input type="checkbox" id="tg-birds" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span class="switch-name">Birds</span></span></label>
+        <label class="switch" for="tg-vessels"><input type="checkbox" id="tg-vessels" checked><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span class="switch-name">Vessels</span></span></label>
+        <label class="switch" for="tg-cpl"><input type="checkbox" id="tg-cpl" checked aria-describedby="tg-cpl-hint"><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span class="switch-name">Polarizing filter</span><span id="tg-cpl-hint" class="hint">Cuts glare off the sea in aerial views, like the reference photo's camera</span></span></label>
+        <label class="switch" for="tg-photo"><input type="checkbox" id="tg-photo" aria-describedby="tg-photo-hint"><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span class="switch-name">Photo markings</span><span id="tg-photo-hint" class="hint">Red tip bands as on the German reference photo</span></span></label>
+        <label class="switch" for="tg-adls"><input type="checkbox" id="tg-adls" aria-describedby="tg-adls-hint"><span class="switch-track" aria-hidden="true"></span><span class="switch-text"><span class="switch-name">Aircraft-detection lighting</span><span id="tg-adls-hint" class="hint">Red lights stay dark until an aircraft is near</span></span></label>
+      </div>
+      <button type="button" class="btn" id="btn-blitz">Trigger blitz near the view <kbd>B</kbd></button>
+    </section>
+
+    <section class="group" aria-label="Rendering quality">
+      <fieldset class="seg text" id="quality-group">
+        <legend>Quality</legend>
+        <div class="seg-items">
+          <input type="radio" name="quality" id="quality-low" value="low"><label for="quality-low">Low</label>
+          <input type="radio" name="quality" id="quality-med" value="med"><label for="quality-med">Med</label>
+          <input type="radio" name="quality" id="quality-high" value="high" checked><label for="quality-high">High</label>
+          <input type="radio" name="quality" id="quality-ultra" value="ultra"><label for="quality-ultra">Ultra</label>
+        </div>
+      </fieldset>
+    </section>
+
+    <footer class="panel-foot">
+      <span id="stats">– fps</span>
+      <span id="notice" hidden></span>
+    </footer>
+  </div>
+</aside>
+
+<section id="caption" aria-label="About this scene">
+  <p class="eyebrow"><span class="lease">OCS-A 0499</span><span class="coords">39.277° N 74.248° W</span><span>planned, not built</span></p>
+  <h1>A planned wind farm off Atlantic City</h1>
+  <p id="caption-text">Vestas V236-15.0 MW on the Atlantic Shores South layout (as permitted, not built) · 1,111 m in-row × 1,852 m between rows · 17 km off Atlantic City</p>
+  <p id="photo-note">The look is matched to a photo of Borkum Riffgrund 1 (German North Sea), Siemens SWT-4.0-120, 83 m hub. The model is New Jersey's planned project; nothing is built off New Jersey yet.</p>
+</section>
+</div>
+
+<noscript><p class="noscript">This 3D scene needs JavaScript and WebGL 2.</p></noscript>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>

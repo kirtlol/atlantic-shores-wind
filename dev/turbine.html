@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turbine dev</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; }
+  #overlay { position: fixed; inset: 0; pointer-events: none; }
+  #hud { position: fixed; left: 8px; top: 8px; color: #fff; font: 11px/1.35 ui-monospace, Menlo, monospace; text-shadow: 0 0 3px #000; white-space: pre; pointer-events: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="overlay"></canvas>
+<div id="hud"></div>
+<script type="module">
+// Dev page for src/turbine/turbine.js + substation.js, lit by the real Atmosphere (sky, sun, env, fog)
+// over a flat water stand-in.
+// ?view=drone|deck|landing|nacelle|root|tip|edge|davit|side|human|substation|ids|lods   ?lod=0|1
+// ?photo=1 (photo-look markings)  ?time=16.5  ?water=0  ?overlay=1 (drone: §20 target rows)
+// ?freeze=1&t=0 (rotor at the reference phase 50 deg)  ?pitch=90 (feathered rotor)  ?hud=0  ?bench=1 (GPU cost with/without the turbine)
+import '../src/env/fog.js';                                   // patch the fog chunks before anything compiles
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { CAMERA_PRESETS, TURBINE, SEA, SCALE_TABLE, QUALITY, TIME_DEFAULT, LOOK, RENDER, rotorRpm } from '../src/config.js';
+import { U, SCALE_REGISTRY, azimuthToDir, param } from '../src/shared.js';
+import { SimClock } from '../src/env/time.js';
+import { Atmosphere } from '../src/env/atmosphere.js';
+import { buildTurbine, buildRotor, composeTurbineMatrices, yawForRotorAzimuth, setPhotoLook, attachTurbineIndex, TURBINE_IDS, TURBINE_LOD_COUNT } from '../src/turbine/turbine.js';
+import { buildSubstation } from '../src/turbine/substation.js';
+import { createDevWater } from './stubs/modeller-env.js';
+import { buildHuman } from './stubs/modeller-human.js';
+
+const VIEW = param('view', 'drone');
+const LOD = Math.min(param('lod', 0), TURBINE_LOD_COUNT - 1);
+const FREEZE = param('freeze', false);
+setPhotoLook(param('photo', false));
+U.uTime.value = param('t', 0);
+
+// ---------------------------------------------------------------- renderer + composer
+const renderer = new THREE.WebGLRenderer({ antialias: false, logarithmicDepthBuffer: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.info.autoReset = false;
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, RENDER.near, RENDER.far);
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(innerWidth, innerHeight, { type: THREE.HalfFloatType, samples: 4 }));
+composer.setPixelRatio(renderer.getPixelRatio()); composer.setSize(innerWidth, innerHeight);
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(new OutputPass());
+
+// ---------------------------------------------------------------- turbines
+const t0 = performance.now();
+const builds = [];
+for (let l = 0; l < TURBINE_LOD_COUNT; l++) builds.push(buildTurbine({ lod: l }));
+const buildMs = performance.now() - t0;
+const yawRad = yawForRotorAzimuth(SEA.windFromDeg);          // rotor faces the wind (200.5 T)
+const omega = rotorRpm(SEA.windSpeed) * 2 * Math.PI / 60;
+const phase0 = TURBINE.referencePhaseDeg * Math.PI / 180;
+const spinAt = (t) => -(phase0 + omega * t);
+
+function assemble(parts, at) {
+  const g = { static: new THREE.Group(), nacelle: new THREE.Group(), rotor: new THREE.Group(), meshes: [] };
+  for (const frame of ['static', 'nacelle', 'rotor']) {
+    g[frame].matrixAutoUpdate = false;
+    for (const p of parts[frame]) {
+      const m = new THREE.Mesh(p.geometry, p.material);
+      m.castShadow = p.castShadow; m.receiveShadow = p.receiveShadow; m.name = p.geometry.name;
+      g[frame].add(m); g.meshes.push(m);
+    }
+    scene.add(g[frame]);
+  }
+  g.pose = (spin) => {
+    const M = composeTurbineMatrices({ x: at.x, y: 0, z: at.z, yawRad, spinRad: spin });
+    g.static.matrix.copy(M.static); g.nacelle.matrix.copy(M.nacelle); g.rotor.matrix.copy(M.rotor);
+    for (const f of ['static', 'nacelle', 'rotor']) g[f].matrixWorldNeedsUpdate = true;
+  };
+  g.setVisible = (v) => { for (const f of ['static', 'nacelle', 'rotor']) g[f].visible = v; };
+  g.pose(spinAt(U.uTime.value));
+  return g;
+}
+// ?pitch=90 swaps in a feathered rotor from buildRotor() (the idle-turbine variant Farm uses).
+const PITCH = param('pitch', 0);
+const heroParts = PITCH ? { ...builds[LOD], rotor: buildRotor({ lod: LOD, pitchDeg: PITCH }) } : builds[LOD];
+const hero = assemble(heroParts, new THREE.Vector3(0, 0, 0));
+const H = builds[0];
+
+// Substation beside the hero (out of the drone frame); its real position is 14.6 km east.
+const substation = buildSubstation();
+const SUB_POS = new THREE.Vector3(-500, 0, -350);
+substation.position.copy(SUB_POS);
+scene.add(substation);
+
+// 1.80 m technician on the platform by the rail, facing outward.
+const human = buildHuman();
+const HUMAN_AZ = 254;
+human.position.copy(azimuthToDir(HUMAN_AZ).multiplyScalar(7.25)).setY(TURBINE.stack.deck);
+human.rotation.y = Math.PI - HUMAN_AZ * Math.PI / 180;
+scene.add(human);
+
+// Instanced ID test: three static assemblies through InstancedMesh with aTurbineIndex 0, 57, 199.
+let idsInfo = null;
+if (VIEW === 'ids') {
+  const fresh = buildTurbine({ lod: 0 });
+  const centre = new THREE.Vector3(0, 0, 320), across = azimuthToDir(164);
+  const slots = [0, 57, 199];
+  for (const p of fresh.static) {
+    const im = new THREE.InstancedMesh(p.geometry, p.material, slots.length);
+    slots.forEach((k, i) => im.setMatrixAt(i, new THREE.Matrix4().makeTranslation(centre.x + across.x * 34 * (i - 1), 0, centre.z + across.z * 34 * (i - 1))));
+    if (p.name === 'idMarkings') { const a = attachTurbineIndex(p.geometry, slots.length); slots.forEach((k, i) => { a.array[i] = k; }); a.needsUpdate = true; }
+    im.castShadow = p.castShadow; im.receiveShadow = p.receiveShadow; im.frustumCulled = false;
+    scene.add(im);
+  }
+  idsInfo = { centre, ids: slots.map(k => TURBINE_IDS[k]) };
+}
+if (VIEW === 'lods') for (let l = 0; l < TURBINE_LOD_COUNT; l++) assemble(buildTurbine({ lod: l }), new THREE.Vector3((l - 0.5) * 270, 0, 1500));
+if (param('water', true)) createDevWater(scene);
+
+// ---------------------------------------------------------------- cameras
+const hubWorld = new THREE.Vector3().setFromMatrixPosition(composeTurbineMatrices({ yawRad, spinRad: 0 }).rotor);
+const rotorFacing = SEA.windFromDeg;
+const V = (x, y, z) => new THREE.Vector3(x, y, z);
+const dirAt = (az, r, y) => azimuthToDir(az).multiplyScalar(r).setY(y);
+function aim(pos, tgt, fov) { camera.position.copy(pos); camera.fov = fov; camera.up.set(0, 1, 0); camera.lookAt(tgt); camera.updateProjectionMatrix(); }
+function preset(p) {
+  camera.position.set(...p.position); camera.rotation.order = 'YXZ';
+  camera.rotation.set(p.pitchDeg * Math.PI / 180, -p.headingDeg * Math.PI / 180, 0);
+  camera.fov = p.vfovDeg; camera.updateProjectionMatrix();
+}
+let shadowFocus = V(0, 130, 0), shadowHalf = 190;
+switch (VIEW) {
+  case 'deck': preset(CAMERA_PRESETS.deck); shadowFocus = V(0, 30, 0); shadowHalf = 60; break;
+  case 'landing': aim(dirAt(20, 14, 2.6).add(azimuthToDir(110).multiplyScalar(5.5)), dirAt(20, 6, 3.5), 50); shadowFocus = V(0, 8, 0); shadowHalf = 25; break;
+  case 'nacelle': { const c = V(0, 153.5, 0).add(azimuthToDir(rotorFacing).multiplyScalar(3)); aim(c.clone().add(azimuthToDir(rotorFacing + 118).multiplyScalar(40)).add(V(0, 9, 0)), c, 42); shadowFocus = c; shadowHalf = 40; break; }
+  case 'root': aim(hubWorld.clone().add(azimuthToDir(rotorFacing + 32).multiplyScalar(17)).add(V(0, -3.5, 0)), hubWorld.clone().add(V(0, 1.5, 0)), 55); shadowFocus = hubWorld; shadowHalf = 30; break;
+  case 'tip': case 'edge': {
+    // the most downward-pointing blade at the current phase, in world space
+    const M = composeTurbineMatrices({ yawRad, spinRad: spinAt(U.uTime.value) });
+    const cone = TURBINE.coneDeg * Math.PI / 180, tipLocal = V(-0.47, 118.5, 3.95).applyAxisAngle(V(1, 0, 0), cone);
+    let best = null;
+    for (let i = 0; i < 3; i++) { const p = tipLocal.clone().applyAxisAngle(V(0, 0, 1), -i * 2 * Math.PI / 3).applyMatrix4(M.rotor); if (!best || p.y < best.y) best = p; }
+    const hubP = new THREE.Vector3().setFromMatrixPosition(M.rotor), along = best.clone().sub(hubP).normalize();
+    const focus = best.clone().addScaledVector(along, VIEW === 'tip' ? -4 : -22);
+    aim(focus.clone().add(azimuthToDir(rotorFacing + 20).multiplyScalar(VIEW === 'tip' ? 13 : 16)).add(V(0, VIEW === 'tip' ? 2 : 4, 0)), focus, VIEW === 'tip' ? 45 : 50);
+    shadowFocus = focus; shadowHalf = 40; break;
+  }
+  case 'davit': { const d = azimuthToDir(20), r = azimuthToDir(110); const c = d.clone().multiplyScalar(10.5).addScaledVector(r, 1.5).setY(19.5); aim(c.clone().addScaledVector(d, 9).addScaledVector(r, 8).setY(26), c, 50); shadowFocus = c; shadowHalf = 20; break; }
+  case 'side': aim(dirAt(rotorFacing + 90, 430, 140), V(0, 136, 0), 40); break;
+  case 'human': aim(dirAt(HUMAN_AZ + 6, 17.5, 20.6), human.position.clone().add(V(0, 0.9, 0)), 40); shadowFocus = V(0, 18, 0); shadowHalf = 25; break;
+  case 'substation': { const c = SUB_POS.clone().add(V(0, 32, 0)); aim(c.clone().add(dirAt(236, 190, 38)), c, 45); shadowFocus = c; shadowHalf = 90; break; }
+  case 'helideck': {                                   // close look at the substation roof: helideck, stair, crane
+    const loc = (x, y, z) => substation.localToWorld(V(x, y, z));
+    substation.updateMatrixWorld();
+    aim(loc(-10, 78, 60), loc(18, 56, 5), 50); shadowFocus = loc(0, 50, 0); shadowHalf = 70; break;
+  }
+  case 'ids': { const c = idsInfo.centre.clone().setY(12.6); aim(c.clone().add(azimuthToDir(254).multiplyScalar(36)).add(V(0, 0.4, 0)), c, 48); shadowFocus = c; shadowHalf = 70; break; }
+  case 'lods': aim(V(0, 140, 2400), V(0, 130, 1500), 45); shadowFocus = V(0, 135, 1500); shadowHalf = 500; break;
+  default: preset(CAMERA_PRESETS.drone);
+}
+camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); camera.updateMatrixWorld();
+
+// ---------------------------------------------------------------- atmosphere (real module)
+const clock = new SimClock({ month: TIME_DEFAULT.month, day: TIME_DEFAULT.day, hours: param('time', TIME_DEFAULT.hours), playing: false });
+const atmosphere = new Atmosphere({ renderer, scene, camera, quality: QUALITY.high, clock });
+atmosphere.setShadowFocus(shadowFocus);
+for (const light of [atmosphere.sunLight, atmosphere.moonLight]) {   // tighter shadow boxes for close-ups
+  const c = light.shadow.camera;
+  c.left = -shadowHalf; c.right = shadowHalf; c.top = shadowHalf; c.bottom = -shadowHalf; c.far = Math.max(1400, 5 * shadowHalf);
+  c.updateProjectionMatrix();
+}
+// Exposure as the Post contract states it: 1.43 / Y(L_horizon), divided by the atmosphere's pre-exposure.
+const applyExposure = () => { renderer.toneMappingExposure = Math.min(atmosphere.exposureTarget, 1e6) / atmosphere.preExposure; };
+applyExposure();
+
+// ---------------------------------------------------------------- reports
+function scaleReport() {
+  return SCALE_REGISTRY.map((e) => {
+    const s = e.measure(), ax = e.expect.axis;
+    const v = ax === 'max' ? Math.max(s.x, s.y, s.z) : s[ax];
+    const ref = SCALE_TABLE[e.name] || e.expect;
+    return { name: e.name, measured: +v.toFixed(3), expected: ref.metres, tol: ref.tolerance, ok: Math.abs(v - ref.metres) <= ref.tolerance };
+  });
+}
+// SCENE-SPEC §20 item 4: rows at the drone preset, 760 x 506, from the measured geometry.
+function pixelRows() {
+  const p = CAMERA_PRESETS.drone;
+  const cam = new THREE.PerspectiveCamera(p.vfovDeg, 760 / 506, 0.5, 150000);
+  cam.position.set(...p.position); cam.rotation.order = 'YXZ'; cam.rotation.set(p.pitchDeg * Math.PI / 180, -p.headingDeg * Math.PI / 180, 0);
+  cam.updateMatrixWorld(); cam.updateProjectionMatrix();
+  const px = (v) => { const q = v.clone().project(cam); return { x: +((q.x + 1) / 2 * 760).toFixed(1), y: +((1 - q.y) / 2 * 506).toFixed(1) }; };
+  const d = H.dims;
+  const rows = {
+    waterline: [px(V(0, 0, 0)).y, 350],
+    tpTop: [px(V(0, d.tpTopY, 0)).y, 325.3],
+    towerTop: [px(V(0, d.towerTopY, 0)).y, 180.5],
+    hub: [px(hubWorld).y, 174],
+    nacelleRoof: [px(V(0, d.towerTopY + TURBINE.nacelle.floorY + d.nacelleHeight, 0)).y, 166.4],
+    skirtBottom: [px(V(0, TURBINE.stack.skirtBottom, 0)).y, 330.5],
+    deck: [px(V(0, d.deckY, 0)).y, 328.8],
+  };
+  const out = {};
+  for (const [k, [got, want]] of Object.entries(rows)) out[k] = { row: got, target: want, dpx: +(got - want).toFixed(2), ok: Math.abs(got - want) <= 2 };
+  out.hubX = { x: px(hubWorld).x, target: 366 };
+  return out;
+}
+const round = (o, n = 3) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, typeof v === 'number' ? +v.toFixed(n) : v]));
+const report = {
+  buildMs: +buildMs.toFixed(0),
+  scale: scaleReport(),
+  pixels: pixelRows(),
+  triangles: builds.map((b, l) => ({ lod: l, ...b.triangles, parts: [...b.static, ...b.nacelle, ...b.rotor].length })),
+  dims: builds.map(b => round(b.dims)),
+  human: +human.userData.height.toFixed(3),
+  substation: { ...round(substation.userData.dims), triangles: substation.userData.triangles, drawCalls: substation.userData.drawCalls },
+  lights: { aviation: H.lights.aviation.map(v => v.toArray().map(n => +n.toFixed(3))), midMast: H.lights.midMast.map(v => v.toArray().map(n => +n.toFixed(2))), marine: H.lights.marine.map(v => v.toArray().map(n => +n.toFixed(2))) },
+  atmosphere: { sunEl: +atmosphere.sunElevationDeg.toFixed(2), sunAz: +atmosphere.sunAzimuthDeg.toFixed(2), exposure: +renderer.toneMappingExposure.toPrecision(4), horizonToSun: +atmosphere.horizonToSunRatio.toFixed(3) },
+};
+window.__turbineReport = report;
+console.log('SCALE ' + JSON.stringify(report.scale.map(r => `${r.ok ? 'ok' : 'FAIL'} ${r.name} ${r.measured} (${r.expected}±${r.tol})`)));
+console.log('PIXELS ' + JSON.stringify(report.pixels));
+console.log('TRIS ' + JSON.stringify(report.triangles));
+console.log('DIMS0 ' + JSON.stringify(report.dims[0]));
+console.log('DIMS12 ' + JSON.stringify(report.dims.slice(1).map(d => ({ hub: d.hubHeight, rotor: d.rotorDiameter, blade: d.bladeLength, tp: d.tpTopY, tower: [d.towerBaseD, d.towerTopD, d.towerTopY], nac: [d.nacelleLength, d.nacelleWidth, d.nacelleHeight], overall: d.overallNacelleLength, spinner: d.spinnerD, chord: d.bladeMaxChord, deck: d.deckY, rail: d.railTopY }))));
+console.log('MISC ' + JSON.stringify({ buildMs: report.buildMs, human: report.human, substation: report.substation, lights: report.lights, atmosphere: report.atmosphere, ids: idsInfo?.ids }));
+
+// ---------------------------------------------------------------- overlay: §20 target rows (drone view)
+const overlay = document.getElementById('overlay');
+function drawOverlay() {
+  overlay.width = innerWidth; overlay.height = innerHeight;
+  const g = overlay.getContext('2d'); g.clearRect(0, 0, overlay.width, overlay.height);
+  if (VIEW !== 'drone' || !param('overlay', false)) return;
+  const sy = innerHeight / 506, sx = innerWidth / 760;
+  g.lineWidth = 1; g.font = '10px monospace'; g.strokeStyle = g.fillStyle = 'rgba(255,0,255,0.9)';
+  for (const [k, v] of Object.entries(report.pixels)) {
+    if (!('target' in v) || k === 'hubX') continue;
+    const y = v.target * sy;
+    g.beginPath(); g.moveTo(330 * sx, y); g.lineTo(345 * sx, y); g.stroke(); g.fillText(k, 250 * sx, y + 3);
+  }
+}
+drawOverlay();
+
+// ---------------------------------------------------------------- loop
+const hud = document.getElementById('hud');
+if (!param('hud', true)) hud.style.display = 'none';
+const timer = new THREE.Timer(); timer.connect(document);
+let frames = 0, fpsT = performance.now(), fps = 0;
+window.__scene = { scaleReport, report, atmosphere, scene, camera, renderer };
+await renderer.compileAsync(scene, camera);
+function renderFrame(dt) {
+  if (!FREEZE) { U.uTime.value += dt; clock.update(dt); }
+  atmosphere.update(dt, U.uTime.value, camera);
+  applyExposure();
+  hero.pose(spinAt(U.uTime.value));
+  renderer.info.reset();
+  composer.render(dt);
+}
+function frame(ts) {
+  timer.update(ts);
+  renderFrame(Math.min(0.1, timer.getDelta()));
+  frames++;
+  const now = performance.now();
+  if (now - fpsT > 500) { fps = frames * 1000 / (now - fpsT); frames = 0; fpsT = now; }
+  const info = renderer.info.render;
+  window.__sceneStats = { fps: +fps.toFixed(1), frameMs: +(1000 / Math.max(fps, 1e-3)).toFixed(2), drawCalls: info.calls, triangles: info.triangles, programs: renderer.info.programs.length, geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures };
+  hud.textContent = `view ${VIEW}  lod ${LOD}  ${fps.toFixed(0)} fps  calls ${info.calls}  tris ${(info.triangles / 1000).toFixed(0)}k  sun ${atmosphere.sunElevationDeg.toFixed(1)}°\n` +
+    `LOD tris ${builds.map(b => (b.triangles.total / 1000).toFixed(1) + 'k').join(' / ')}  scale ${report.scale.filter(r => r.ok).length}/${report.scale.length} ok`;
+}
+// GPU cost: N synchronised frames with the hero shown vs hidden (other agents share the GPU: compare, don't trust absolutes).
+if (param('bench', false)) {
+  const gl = renderer.getContext(), px = new Uint8Array(4);
+  const timeFrames = (n) => { const a = performance.now(); for (let i = 0; i < n; i++) { renderFrame(0); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); } return (performance.now() - a) / n; };
+  timeFrames(10);
+  const res = {};
+  for (let round = 0; round < 3; round++) {
+    hero.setVisible(true); substation.visible = false; res.withTurbine = Math.min(res.withTurbine ?? 1e9, timeFrames(40));
+    hero.setVisible(false); res.without = Math.min(res.without ?? 1e9, timeFrames(40));
+    hero.setVisible(false); substation.visible = true; res.substationOnly = Math.min(res.substationOnly ?? 1e9, timeFrames(40));
+  }
+  hero.setVisible(true);
+  res.turbineMs = +(res.withTurbine - res.without).toFixed(2); res.substationMs = +(res.substationOnly - res.without).toFixed(2);
+  console.log('BENCH ' + JSON.stringify(round(res, 2)));
+}
+renderer.setAnimationLoop(frame);
+let readyFrames = 0;
+const readyCheck = () => { if (++readyFrames >= 3) window.__sceneReady = true; else requestAnimationFrame(readyCheck); };
+requestAnimationFrame(readyCheck);
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight); drawOverlay();
+});
+</script>
+</body>
+</html>

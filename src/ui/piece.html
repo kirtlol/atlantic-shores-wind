@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Offshore wind off Atlantic City (planned)</title>
+<!-- The hosted page for a kirt.lol three-piece (freeze this file as the piece's index.html). The
+     site builder takes the page's first style element (every rule scoped under .stage; it is
+     src/ui/hud.css) and the .stage block; its loader imports the bundle of src/main.js, which finds
+     .stage .hud and runs in hosted mode (slim HUD, no panel, host contract on window.__app). Test it
+     locally with dev/shell-hosted.html. (This comment must not spell the style tag: the current
+     builder scans the raw text for it, comments included.) -->
+<style>
+.stage .scene-tag {
+  position: absolute;
+  left: 12px;
+  bottom: 10px;
+  z-index: 2;
+  margin: 0;
+  padding: 3px 7px 4px;
+  border-radius: 4px;
+  background: rgba(3, 5, 7, 0.38);
+  color: rgba(236, 231, 223, 0.86);
+  font: 500 10px/1.2 ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* The canvas takes keyboard focus (arrow keys pan, Shift + arrows orbit, Space pauses time): a ring
+   shows where focus is for keyboard users only. */
+.stage canvas#scene { touch-action: none; outline: none; }
+.stage canvas#scene:focus-visible { outline: 2px solid rgba(240, 217, 181, 0.85); outline-offset: -2px; }
+</style>
+</head>
+<body>
+<div class="stage"><canvas id="scene" tabindex="0" aria-label="A planned offshore wind farm off Atlantic City. Drag to look around; with the keyboard, arrow keys pan and Space pauses time."></canvas><div class="scene-tag" aria-hidden="true"><span id="tag-time">20:00</span> <span id="tag-tz">EDT</span> · planned, not built</div><div class="hud"><span class="hint"><span class="t-touch">Drag to look around · pinch to zoom</span><span class="t-mouse">Drag to look around · scroll to zoom · Space pauses time</span></span><button id="btn-time" type="button" aria-pressed="true">Time-lapse</button><button id="btn-view" type="button">Next view</button><button id="btn-blitz" type="button">Blitz</button></div></div>
+</body>
+</html>

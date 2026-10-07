@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Shell dev page (hosted)</title>
+<!-- Hosted-mode test page: the stage markup a host page (kirt.lol) gives the piece, a wide (16:9) stage
+     with the slim HUD under it, and a minimal loader (shell-hosted.js) that exercises the host contract:
+     __SW_HINT, __app.world, __ready / __bootError, moduleStatus(), stop(). ?hint=low|med|high,
+     ?aspect=W:H for another wide stage shape. -->
+<link rel="stylesheet" href="./shell-hosted.css">
+<link rel="stylesheet" href="../src/ui/hud.css">
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"}}
+</script>
+</head>
+<body class="piece">
+<header class="bar"><span class="wm">host page</span><span class="title">Offshore Wind</span></header>
+<main class="piece-main">
+<div class="stage"><canvas id="scene" tabindex="0" aria-label="A planned offshore wind farm off Atlantic City. Drag to look around; with the keyboard, arrow keys pan and Space pauses time."></canvas><div class="scene-tag" aria-hidden="true"><span id="tag-time">20:00</span> <span id="tag-tz">EDT</span> · planned, not built</div><div class="hud"><span class="hint"><span class="t-touch">Drag to look around · pinch to zoom</span><span class="t-mouse">Drag to look around · scroll to zoom · Space pauses time</span></span><button id="btn-time" type="button" aria-pressed="true">Time-lapse</button><button id="btn-view" type="button">Next view</button><button id="btn-blitz" type="button">Blitz</button></div></div>
+</main>
+<script type="module" src="./shell-hosted.js"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+/* Host-page styles for the scene's own elements (owner: shell). Every selector is scoped under
+   .stage, because a host (kirt.lol) merges this block into the stylesheet of its whole page; the
+   host styles its .hud pills, hint and .t-touch/.t-mouse itself. */
+.stage .scene-tag {
+  position: absolute;
+  left: 12px;
+  bottom: 10px;
+  z-index: 2;
+  margin: 0;
+  padding: 3px 7px 4px;
+  border-radius: 4px;
+  background: rgba(3, 5, 7, 0.38);
+  color: rgba(236, 231, 223, 0.86);
+  font: 500 10px/1.2 ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* The canvas takes keyboard focus (arrow keys pan, Shift + arrows orbit, Space pauses time): a ring
+   shows where focus is for keyboard users only. */
+.stage canvas#scene { touch-action: none; outline: none; }
+.stage canvas#scene:focus-visible { outline: 2px solid rgba(240, 217, 181, 0.85); outline-offset: -2px; }

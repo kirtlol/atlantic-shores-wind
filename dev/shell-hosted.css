@@ -1,0 +1,19 @@
+/* A stand-in for the host page's layout (kirt.lol piece.css "stage": "wide", simplified): a bar, a 16:9 stage as
+   wide as the viewport allows with the HUD rows under it (nothing over the picture but the scene's own tag), never
+   scrolling. Only for dev/shell-hosted.html; ?aspect=W:H (set by shell-hosted.js) tries other wide shapes. */
+:root { color-scheme: dark; --bar: 56px; --hudh: 104px; --ar: calc(16 / 9); }
+html, body { height: 100%; margin: 0; background: #030507; color: #8d949a; font: 12px/1.4 ui-monospace, Menlo, monospace; overflow: hidden; }
+.bar { position: fixed; top: 0; left: 0; right: 0; height: var(--bar); display: flex; justify-content: space-between; align-items: center; padding: 0 18px; color: #ece7df; }
+.piece-main { position: fixed; inset: var(--bar) 0 var(--hudh) 0; display: grid; place-items: center; }
+.stage {
+  --sw: min(100vw, calc((100vh - var(--bar) - var(--hudh)) * var(--ar)));
+  position: relative; width: var(--sw); height: calc(var(--sw) / var(--ar));
+  background: linear-gradient(180deg, #b0bed1 0%, #cecfcb 40%, #808894 47%, #364153 70%, #040914 100%);
+}
+.stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.hud { position: absolute; left: 0; right: 0; top: calc(100% + 14px); display: flex; gap: 8px; align-items: center; justify-content: center; flex-wrap: wrap; padding: 0 12px; }
+.hud .hint { flex: 1 1 100%; text-align: center; }
+.hud button { font: inherit; color: #c9c3ba; background: rgba(236,231,223,.04); border: 1px solid rgba(236,231,223,.18); border-radius: 999px; min-height: 34px; padding: 0 14px; cursor: pointer; }
+.hud button[aria-pressed="true"] { color: #f0d9b5; border-color: rgba(240,217,181,.45); }
+.t-mouse { display: none; }
+@media (hover: hover) and (pointer: fine) { .t-touch { display: none; } .t-mouse { display: inline; } }
