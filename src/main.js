@@ -236,6 +236,35 @@ function transitionSeconds(a, b) {
   return clamp(1.4 + 0.9 * Math.log10(1 + d / 100) + 0.6 * turn, 1.4, 4.0);
 }
 
+// Transitions leave and reach the close-ups beside the hero's steel through clear points (flash-verify, 2026-10-07).
+// The deck eye stands 1.7 m ahead of the CTV's wheelhouse (mast top ~11.6 m) and the nacelle-roof eye on the heli
+// deck at the rear edge of the nacelle; interpolated straight to or from a far pose, the camera flew through the
+// wheelhouse or down through the heli deck and its struts: 1-7 frames of a dark cabin or white steel filling the view,
+// a black or white flash on the way in or out (up to 85 levels of mean luma). A pose low beside the hero (within
+// CLEAR.lowR of its axis, below CLEAR.lowY) is left and reached straight up through CLEAR.lowTo (above the CTV and
+// the TP platform); a pose high beside it (within CLEAR.highR, above CLEAR.highY) out along its own bearing through
+// CLEAR.highToR at CLEAR.highToY or higher (behind and above the nacelle). Each such leg takes CLEAR_LEG_S, eased
+// like the rest; every other transition is the single eased leg it always was.
+const CLEAR = { lowR: 45, lowY: 14, lowTo: 24, highR: 30, highY: 140, highToR: 30, highToY: 166 };
+const CLEAR_LEG_S = 1.2;
+function clearPose(p) {
+  const { x, y, z } = p.pos, r = Math.hypot(x, z);
+  let k = 1, h;
+  if (r < CLEAR.lowR && y < CLEAR.lowY) h = CLEAR.lowTo;
+  else if (r < CLEAR.highR && y > CLEAR.highY) { h = Math.max(y, CLEAR.highToY); if (r > 1) k = CLEAR.highToR / r; }
+  else return null;
+  const c = makePose();
+  c.pos.set(x * k, h, z * k); c.heading = p.heading; c.pitch = p.pitch; c.fov = p.fov; c.pivot = p.pivot;
+  return c;
+}
+// The pose at progress s of a transition: its path is poses joined by eased lerpPose legs; `at` holds the progress
+// at which each pose is reached.
+function pathPose({ path, at }, s, out) {
+  let i = 0;
+  while (i < path.length - 2 && s > at[i + 1]) i++;
+  return lerpPose(path[i], path[i + 1], smootherstep((s - at[i]) / (at[i + 1] - at[i])), out);
+}
+
 function focusOf(blitz) {
   const f = blitz?.focus?.();
   return f && Number.isFinite(f.x) && Number.isFinite(f.z) ? f : null;
@@ -296,7 +325,14 @@ class CameraRig {
       return true;
     }
     const from = this._currentPose();
-    this.transition = { from, to: pose, s: 0, duration: transitionSeconds(from, pose), view: name };
+    // from, its clear point, the target's clear point, the target (see CLEAR); a leg to or from a clear point takes
+    // CLEAR_LEG_S, the swing between them the time the whole move always took
+    const cf = clearPose(from), ct = clearPose(pose), path = [from, cf, ct, pose].filter(Boolean);
+    const legs = [cf && CLEAR_LEG_S, transitionSeconds(from, pose), ct && CLEAR_LEG_S].filter(Boolean);
+    const duration = legs.reduce((a, b) => a + b), at = [0];
+    for (const d of legs) at.push(at[at.length - 1] + d / duration);
+    at[legs.length] = 1;
+    this.transition = { from, to: pose, s: 0, duration, view: name, path, at };
     this.controls.enabled = false;
     return true;
   }
@@ -327,7 +363,7 @@ class CameraRig {
     if (this.transition) {
       const tr = this.transition;
       tr.s = Math.min(1, tr.s + realDt / tr.duration);
-      this._apply(lerpPose(tr.from, tr.to, smootherstep(tr.s), this._pose));
+      this._apply(pathPose(tr, tr.s, this._pose));
       if (tr.s >= 1) {
         this.transition = null;
         if (tr.view === 'cinematic') this.cine = { tau: 0 };
@@ -966,6 +1002,7 @@ async function boot() {
   const _px = new THREE.Vector2();
   function resize() {
     if (stopped) return;
+    resizePending = false;
     const [w, h] = stageSize();
     const pr = pixelRatioFor(ctx.quality, w, h);
     renderer.setPixelRatio(pr);
@@ -975,6 +1012,16 @@ async function boot() {
     ctx.post?.setSize(w, h, pr);
     world.px = renderer.getDrawingBufferSize(_px).x;
   }
+  // While the loop draws frames, a resize (an adaptive-resolution step, the stage's ResizeObserver, a
+  // device-pixel-ratio change, a quality switch) waits for the start of the next frame. Setting the canvas size
+  // gives it a new, cleared drawing buffer, and three always creates an alpha: true context, so a canvas resized
+  // after its frame was drawn (adapt() runs after stepFrame; ResizeObserver callbacks run after the frame's rAF
+  // callbacks) showed the page behind it, the stage's CSS backdrop (in index.html a pale sky over a navy sea):
+  // a one-frame flash at every governor step, and one as long as the compile on a quality switch
+  // (flash fix, 2026-10-07). Resized at the start of a frame, the new buffer is drawn before it is shown.
+  // Without the loop (boot, capture: frames are stepped) the resize is immediate, as before.
+  let resizePending = false;
+  const requestResize = () => { if (running || compiling) resizePending = true; else resize(); };
 
   // The URL that reproduces the current state: the standalone page reloads with it after a lost graphics
   // context (a host reloads its own page, so a host bundle leaves it out).
@@ -996,6 +1043,7 @@ async function boot() {
   };
 
   let compiling = null;                  // promise while programs compile after a quality switch
+  let forceAtmosphere = false;           // the next frame's atmosphere update rebuilds everything (see setToggle)
   const api = {
     ctx,
     setTime(h) {
@@ -1027,7 +1075,9 @@ async function boot() {
         renderer.setAnimationLoop(null);
         // One module per task, so no single task holds the page (they rebuild meshes and targets).
         let c0 = globalThis.NJOW_DEV === false ? 0 : performance.now();
-        resize();
+        // The canvas keeps the last frame while the new programs compile; the first frame of the new tier
+        // resizes it (see requestResize). A capture has no loop to resume: it resizes now, as before.
+        if (P.capture) resize(); else resizePending = true;
         if (ctx.post) safeCall('post', 'setQuality', () => ctx.post.setQuality(ctx.quality));
         globalThis.NJOW_DEV === false || (timing.post = since(c0));
         for (const key of UPDATE_ORDER) {
@@ -1086,6 +1136,10 @@ async function boot() {
     setToggle(name, on) {
       if (!(name in state.toggles)) return;
       on = !!on;
+      // The polarizer is a step in what the sky looks like through the camera: the atmosphere rebuilds its tables
+      // synchronously for it (as for a clock jump). Left to its asynchronous read-back, the exposure anchor and the fog
+      // colour kept the old filter for 2 frames: a 2-frame flash of about +-12 levels (flash-verify, 2026-10-07).
+      if (name === 'cpl' && on !== state.toggles.cpl) forceAtmosphere = true;
       state.toggles[name] = on;
       if (MODULE_TOGGLES.has(name)) setModuleEnabled(name, on);
       else if (name === 'photo') { const f = mods.turbine?.setPhotoLook; if (f) safeCall('turbine', 'setPhotoLook', () => f(on)); }
@@ -1160,13 +1214,13 @@ async function boot() {
     });
   };
 
-  const updateModules = (dt, t) => {
+  const updateModules = (dt, t, force = false) => {
     if (ctx.clock) safeCall('clock', 'update', () => ctx.clock.update(dt));
     for (const key of UPDATE_ORDER) {
       const m = ctx[key];
       if (!m || !moduleActive(key)) continue;
       const before = scene.children.length;
-      safeCall(key, 'update', () => m.update(dt, t, camera));
+      safeCall(key, 'update', () => (force && key === 'atmosphere' ? m.update(dt, t, camera, { force }) : m.update(dt, t, camera)));
       if (scene.children.length > before && roots[key]) roots[key].push(...scene.children.slice(before));
     }
   };
@@ -1223,6 +1277,7 @@ async function boot() {
     else renderer.render(scene, camera);
   };
   stepFrame = (realDt, simDt) => {
+    if (resizePending) resize();                 // before anything reads the drawing-buffer size this frame
     const dt = state.frozen ? 0 : simDt;
     if (!state.frozen) U.uTime.value += dt;
     const t = U.uTime.value;
@@ -1231,7 +1286,9 @@ async function boot() {
     U.uCameraPos.value.copy(camera.position);
     updateCameraAccessories();
     updateShadowFocus();
-    updateModules(dt, t);
+    const force = forceAtmosphere;
+    forceAtmosphere = false;
+    updateModules(dt, t, force);
     renderFrame(realDt);
     world.frame++;
     world.t = t;
@@ -1249,7 +1306,7 @@ async function boot() {
     let next = gov.scale;
     if (gov.slow > ADAPT.slowS && gov.scale > ADAPT.min) next = Math.max(ADAPT.min, gov.scale - ADAPT.step);
     else if (gov.fast > ADAPT.fastS && gov.scale < maxScale - 1e-6) next = Math.min(maxScale, gov.scale + ADAPT.step);
-    if (next !== gov.scale) { gov.scale = next; gov.slow = 0; gov.fast = 0; gov.ema = 16.7; resize(); }
+    if (next !== gov.scale) { gov.scale = next; gov.slow = 0; gov.fast = 0; gov.ema = 16.7; requestResize(); }
   };
 
   let readyFrames = 0;
@@ -1307,7 +1364,7 @@ async function boot() {
 
   // Size from the stage (not the window). The observer is created here, unguarded: a host that
   // cannot provide one gets a boot error, not a silently unsized canvas.
-  ro = new ResizeObserver(() => resize());
+  ro = new ResizeObserver(() => requestResize());
   ro.observe(stage);
   // A device-pixel-ratio change alone (window moved between displays) fires no resize.
   let dprQuery = null;
@@ -1317,7 +1374,7 @@ async function boot() {
     dprQuery.addEventListener('change', onDpr);
   };
   let lastDpr = window.devicePixelRatio || 1;
-  function onDpr() { lastDpr = window.devicePixelRatio || 1; resize(); watchDpr(); }
+  function onDpr() { lastDpr = window.devicePixelRatio || 1; requestResize(); watchDpr(); }
   watchDpr();
   cleanups.push(() => dprQuery?.removeEventListener('change', onDpr));
 

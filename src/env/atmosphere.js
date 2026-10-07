@@ -1136,6 +1136,10 @@ function moonDiskMean(iDeg) {
 
 // ================================================================== Atmosphere
 
+// A clock running at 600x or more with the sun between -14 and +12 deg: the light changes by a large factor every frame
+// (flash-verify, 2026-10-07; the ocean's sky panorama uses the same test).
+function fastTwilight(clock, sunEl) { return !!clock?.playing && clock.speed >= 600 && sunEl > -14 && sunEl < 12; }
+
 export class Atmosphere {
   /**
    * @param {object} ctx { renderer, scene, camera, quality, clock } (clock optional: a default SimClock)
@@ -1376,7 +1380,12 @@ export class Atmosphere {
       } else {
         gain.value = 1;
         this._renderSkyView(sunDir, moonDir, camAlt, camPos);
-        this._renderAmbient(false, camPos);
+        // A fast time-lapse (600x and up) through dawn or dusk moves the light by up to stops a frame; read back late,
+        // this table (the exposure anchor, the fog colour) lagged the sky by one frame or two in turn: a 30 Hz flicker of
+        // the whole frame, +-6 levels at 60 fps, +-30 at 10 fps (flash-verify, 2026-10-07). There the live loop reads it
+        // at once (a main-thread wait for the GPU, twilight only); a capture waits for its own read-backs every frame
+        // (its table is always the previous frame's) and stays as it was.
+        this._renderAmbient(fastTwilight(clock, sun.elevationDeg) && !this.ctx.world?.params?.capture, camPos);
       }
       ls.sun.copy(sunDir); ls.moon.copy(moonDir); ls.h = camAlt; ls.x = camPos.x; ls.z = camPos.z;
       ls.pre = this.preExposure; ls.moonE = this._moonTOAY; ls.cover = this.cloudCover; ls.pol = U.uPolarizer.value;

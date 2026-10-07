@@ -233,6 +233,9 @@ input[type="range"]:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 2px var(
 
 /* segmented radios */
 .seg { border: 0; margin: 0; padding: 0; min-width: 0; }
+/* the visually hidden inputs below are absolutely positioned: anchor them inside their control, or focusing one
+   scrolls the whole page (the scene jumped up 149 px on short windows; flash-verify 2026-10-07) */
+.seg, .switch { position: relative; }
 .seg legend { padding: 0; margin-bottom: 6px; }
 .seg-items { display: flex; height: var(--hit); box-sizing: border-box; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; background: var(--field); }
 .seg input { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }

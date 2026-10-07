@@ -334,6 +334,11 @@ export class Ocean {
       if (this._clockVersion !== undefined) this.skyMap._pos = null;
       this._clockVersion = clockVersion;
     }
+    // A fast time-lapse (600x and up) through dawn or dusk changes the sky every frame, and the panorama follows it every
+    // frame: refreshed every second, the sea's reflection of the sky lagged by a frame in turn, a 30 Hz sawtooth on the
+    // sea (flash-verify, 2026-10-07; same test as the atmosphere's table read-back). A capture keeps the old cadence.
+    const clock = this.ctx.clock, sunEl = this.atmosphere?.sunElevationDeg;
+    if (clock?.playing && clock.speed >= 600 && sunEl > -14 && sunEl < 12 && !this.ctx.world?.params?.capture) this.skyMap._pos = null;
     this.skyMap.update(camera, t);
     this._pileSurge(dt, t, camera);
     this.effects.update(t, camera, this.snap, this.eased.windSpeed);
