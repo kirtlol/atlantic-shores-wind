@@ -10,7 +10,7 @@ export const SITE = {
   atlanticCity: { distanceM: 17900, bearingDeg: 302.7 }, // [3.1]
   waterDepthM: 22,                                        // [3.1] ESTIMATED at the hero
   tzStandard: -5, tzDaylight: -4,                         // EST / EDT
-  caption: 'Vestas V236-15.0 MW on the Atlantic Shores South layout (as permitted, not built) · 1,111 m in-row × 1,852 m between rows · 17 km off Atlantic City',
+  caption: 'Vestas V236-15.0 MW on the Atlantic Shores South layout (planned) · 1,111 m in-row × 1,852 m between rows · 17 km off Atlantic City',
   photoNote: 'Reference photo: Borkum Riffgrund 1 (German North Sea), Siemens SWT-4.0-120, 83 m hub.',
 };
 

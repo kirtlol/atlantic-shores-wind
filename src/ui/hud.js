@@ -3,7 +3,7 @@
 // used there. Nothing here depends on the stage's shape: main.js sizes the scene from the stage.
 //
 // Markup (inside the host's .stage; all optional, every lookup is null-safe):
-//   <div class="scene-tag" aria-hidden="true"><span id="tag-time">20:00</span> <span id="tag-tz">EDT</span> · planned, not built</div>
+//   <div class="scene-tag" aria-hidden="true"><span id="tag-time">20:00</span> <span id="tag-tz">EDT</span></div>
 //   <div class="hud">
 //     <span class="hint"><span class="t-touch">…</span><span class="t-mouse">…</span></span>
 //     <button id="btn-time" type="button" aria-pressed="true">Time-lapse</button>
